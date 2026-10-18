@@ -401,6 +401,9 @@ PY;
 // ───────────────────────────── API ─────────────────────────────
 $a = $_GET['a'] ?? '';
 if ($a !== '') {
+    ini_set('display_errors', '0'); // PHP warnings must never leak into JSON responses
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$_POST && !$_FILES && (int)($_SERVER['CONTENT_LENGTH'] ?? 0) > 0)
+        json_out(['error' => 'Upload too big for this PHP server (limit ' . ini_get('post_max_size') . '). Stop it and start the app with:  php index.php'], 413);
     @mkdir(JOBS, 0755, true);
     @mkdir(VOICES, 0755, true);
 
@@ -716,7 +719,10 @@ pre.log { background:var(--well); border:1px solid var(--edge); padding:10px; ma
 
 <script>
 const $ = s => document.querySelector(s);
-const api = (a, body) => fetch('?a=' + a, body ? {method:'POST', body} : {}).then(async r => { const j = await r.json(); if (!r.ok) throw new Error(j.error || r.statusText); return j; });
+const api = (a, body) => fetch('?a=' + a, body ? {method:'POST', body} : {}).then(async r => {
+  const t = await r.text(), i = t.search(/^[{[]/m); // skip any PHP warning HTML printed before the JSON
+  let j; try { j = JSON.parse(i < 0 ? t : t.slice(i)); } catch { throw new Error(`Server sent an unexpected reply (${r.status}). Restart the app with:  php index.php`); }
+  if (!r.ok) throw new Error(j.error || r.statusText); return j; });
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
 // theme
