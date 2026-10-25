@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Voice Swap installer — macOS (Apple Silicon or Intel) and Debian/Ubuntu.
+# Toon House installer — macOS (Apple Silicon or Intel) and Debian/Ubuntu.
 #
-#   curl -fsSL https://raw.githubusercontent.com/lalomorales22/voice-swap/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/lalomorales22/toon-house/main/install.sh | bash
 #   or, from inside a clone:   ./install.sh
 #
 # It installs the few system tools the app needs (PHP, ffmpeg, Python 3.11, git), gets the app,
@@ -11,11 +11,11 @@
 # Flags:  --yes          answer yes to every question
 #         --no-engine    skip the engine (you can click "Install engine" in the app later)
 #         --ollama       also set up Ollama + a small model for the AI Director and voxel buddies
-#         --dir <path>   where to put the app (default: the current clone, or ~/voice-swap)
+#         --dir <path>   where to put the app (default: the current clone, or ~/toon-house)
 #         --no-start     don't start the app at the end
 set -euo pipefail
 
-REPO="https://github.com/lalomorales22/voice-swap.git"
+REPO="https://github.com/lalomorales22/toon-house.git"
 YES=0; ENGINE=1; OLLAMA=0; START=1; DIR=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -44,7 +44,7 @@ ask() {   # ask "question" [default y|n] — reads from the terminal even when p
 }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-bold "Voice Swap installer"
+bold "Toon House installer"
 echo "Put your voice on any song, build talking toons, design games. Everything runs on this machine."
 
 OS="$(uname -s)"
@@ -94,13 +94,13 @@ for ext in curl mbstring json; do php -r "exit(extension_loaded('$ext') ? 0 : 1)
 # ── 2. the app ──
 step "The app"
 if [ -z "$DIR" ]; then
-  if [ -f "./index.php" ] && grep -q "VOICE SWAP" ./index.php 2>/dev/null; then DIR="$(pwd)"; else DIR="$HOME/voice-swap"; fi
+  if [ -f "./index.php" ] && grep -q "TOON HOUSE" ./index.php 2>/dev/null; then DIR="$(pwd)"; else DIR="$HOME/toon-house"; fi
 fi
 if [ -f "$DIR/index.php" ]; then
   ok "Found the app in $DIR"
   if [ -d "$DIR/.git" ] && ask "Pull the latest version?" y; then git -C "$DIR" pull --ff-only || warn "Couldn't pull (local changes?). Continuing with what's there."; fi
 else
-  ask "Clone Voice Swap into $DIR?" y || die "Choose a folder with --dir <path>."
+  ask "Clone Toon House into $DIR?" y || die "Choose a folder with --dir <path>."
   git clone --depth 1 "$REPO" "$DIR"
   ok "Cloned into $DIR"
 fi

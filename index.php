@@ -1,6 +1,6 @@
 <?php
 /*
- * VOICE SWAP — single-file local voice conversion studio (macOS / Linux)
+ * TOON HOUSE — Voice Swap, Toon Lab and Game Creator in one local PHP file (macOS / Linux)
  *
  *   Start:   php index.php            (launches server on http://127.0.0.1:8777 and opens browser)
  *   Install: click "Install engine" in the page, or:  php index.php setup
@@ -1753,7 +1753,7 @@ const GAME_HOST_HTML = <<<'HTML'
 <nav><button id="pause">Pause</button><button id="restart">Restart</button><button id="mute">Mute</button><span id="status">READY</span></nav>
 <p id="instructions"></p>
 <div class="touch"><div class="pad"><button class="up" data-key="ArrowUp" aria-label="Up">▲</button><button class="left" data-key="ArrowLeft" aria-label="Left">◀</button><button data-key="ArrowDown" aria-label="Down">▼</button><button data-key="ArrowRight" aria-label="Right">▶</button></div><div class="actions"><button data-key="KeyZ">A</button><button data-key="KeyX">B</button><button data-key="Enter">Start</button></div></div>
-<p class="credit">Made with Voice Swap · Game Creator</p>
+<p class="credit">Made with Toon House · Game Creator</p>
 <script>__RUNTIME__</script>
 <script>
 const CONFIG = __CONFIG__;
@@ -2325,7 +2325,7 @@ if (PHP_SAPI === 'cli') {
         exit($rc);
     }
     $url = 'http://127.0.0.1:' . PORT;
-    echo "\n  VOICE SWAP running at $url  (Ctrl+C to stop)\n\n";
+    echo "\n  TOON HOUSE running at $url  (Ctrl+C to stop)\n\n";
     if (PHP_OS_FAMILY === 'Darwin') exec('(sleep 1; open ' . escapeshellarg($url) . ') > /dev/null 2>&1 &');
     putenv('PHP_CLI_SERVER_WORKERS=8');   // long requests (the AI Director, scene pictures) mustn't block the page
     passthru(escapeshellarg(PHP_BINARY) . ' -d upload_max_filesize=1G -d post_max_size=1G -d max_execution_time=0 -d memory_limit=512M'
@@ -2893,7 +2893,7 @@ $page = in_array($_GET['p'] ?? '', ['toon', 'game'], true) ? $_GET['p'] : 'swap'
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title><?= ['swap' => 'Voice Swap', 'toon' => 'Toon Lab', 'game' => 'Game Creator'][$page] ?></title>
+<title>Toon House · <?= ['swap' => 'Voice Swap', 'toon' => 'Toon Lab', 'game' => 'Game Creator'][$page] ?></title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=JetBrains+Mono:wght@400;600&family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
 <?php if ($page === 'toon' || $page === 'game'): ?>
@@ -3225,7 +3225,7 @@ details.fold[open] > summary { margin-bottom:10px; }
 </head>
 <body>
 <header>
-  <h1>Voice <span>Swap</span></h1>
+  <h1>Toon <span>House</span></h1>
   <nav class="tabs"><a href="./" class="<?= $page === 'swap' ? 'on' : '' ?>">🎤 Voice Swap</a><a href="?p=toon" class="<?= $page === 'toon' ? 'on' : '' ?>">🎬 Toon Lab</a><a href="?p=game" class="<?= $page === 'game' ? 'on' : '' ?>">🕹 Game Creator</a></nav>
   <div class="tag"><?= ['swap' => 'put your voice on any song · runs 100% on this Mac', 'toon' => 'build a toon · it lip-syncs & moves to your audio', 'game' => 'your toons star in games you design · no engine, no API'][$page] ?></div>
   <div class="themes" id="themes">
@@ -3236,7 +3236,7 @@ details.fold[open] > summary { margin-bottom:10px; }
 <script>
 const $ = s => document.querySelector(s);
 const api = (a, body) => fetch('?a=' + a, body ? {method:'POST', body} : {}).catch(() => {
-  throw new Error("Can't reach the app server. It may have stopped — run  php index.php  in the voice-swap folder, then reload this page.");
+  throw new Error("Can't reach the app server. It may have stopped — run  php index.php  in the toon-house folder, then reload this page.");
 }).then(async r => {
   const t = await r.text(), i = t.search(/^[{[]/m); // skip any PHP warning HTML printed before the JSON
   let j; try { j = JSON.parse(i < 0 ? t : t.slice(i)); } catch { throw new Error(`Server sent an unexpected reply (${r.status}). Restart the app with:  php index.php`); }

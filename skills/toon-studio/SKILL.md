@@ -1,18 +1,18 @@
 ---
 name: toon-studio
-description: Make talking cartoon videos and speech audio locally with the Voice Swap / Toon Lab app. A cartoon character (classic, anime, comic, sketch, clay, 3D ASCII, matrix, pixel, neon, noir or blueprint style) or a realistic 3D person says a script out loud, lip-synced, with subtitles and captions, rendered to MP4. It can also read any text in the user's own cloned voice. Use whenever the user asks to make, create or render a cartoon/toon/animated character video, a talking head, a character "talking about" a topic, a news-style or explainer clip with a character, an ASCII or anime style animation, lip-sync, a realistic / lifelike 3D human presenter (and building new 3D people in Blender), or to have text spoken in their voice (e.g. "go create a hacker on a computer in that weird 3d ascii style talking about local ai news").
+description: Make talking cartoon videos and speech audio locally with the Toon House app (Voice Swap + Toon Lab). A cartoon character (classic, anime, comic, sketch, clay, 3D ASCII, matrix, pixel, neon, noir or blueprint style) or a realistic 3D person says a script out loud, lip-synced, with subtitles and captions, rendered to MP4. It can also read any text in the user's own cloned voice. Use whenever the user asks to make, create or render a cartoon/toon/animated character video, a talking head, a character "talking about" a topic, a news-style or explainer clip with a character, an ASCII or anime style animation, lip-sync, a realistic / lifelike 3D human presenter (and building new 3D people in Blender), or to have text spoken in their voice (e.g. "go create a hacker on a computer in that weird 3d ascii style talking about local ai news").
 ---
 
 # Toon Studio (Voice Swap + Toon Lab)
 
 Everything runs on this Mac: Kokoro text-to-speech, Seed-VC voice conversion (the user's own voice), wav2vec2 lip-sync, and a headless-Chrome renderer that records the Toon Lab page to MP4. You write a **spec** (JSON); the app does the rest.
 
-App folder (contains `index.php`): `/Users/megabrain/Desktop/new-OS-Apps/voice-swap`.
+App folder (contains `index.php`): `/Users/megabrain/Desktop/new-OS-Apps/toon-house`.
 The app also has a 🕹 Game Creator page (games built in the browser from the user's toons and voxel buddies). It has no CLI or API for building games, so agents don't drive it; point the user at it instead.
 If the app was moved, or you're another agent on another machine, use the folder you were given and set it in `APP` below.
 
 ```bash
-APP="${TOON_STUDIO:-/Users/megabrain/Desktop/new-OS-Apps/voice-swap}"
+APP="${TOON_STUDIO:-/Users/megabrain/Desktop/new-OS-Apps/toon-house}"
 php "$APP/index.php" options            # every valid option, preset, saved voice, TTS voice and font, as JSON
 php "$APP/index.php" make spec.json --wait   # speak → lip-sync → render; prints JSON with render_path at the end
 php "$APP/index.php" status <id> --wait      # follow a project started without --wait

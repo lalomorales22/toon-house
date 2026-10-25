@@ -1,4 +1,6 @@
-# Voice Swap
+# Toon House
+
+Three rooms, one local app: **Voice Swap** puts your own voice on any song, **Toon Lab** makes cartoons and 3D people that lip-sync in it, and the **Game Creator** turns them into playable games. Free, offline, no training, no API keys.
 
 Put **your own voice** on any song — locally, free, no training.
 
@@ -6,7 +8,7 @@ Give it 10–30 seconds of you talking (or singing) and a target track (e.g. a S
 
 Everything is one file: **`index.php`**. The first time you open it, it installs its own engine next to itself.
 
-![Voice Swap — put your voice on any song](docs/voice-swap.jpg)
+![Toon House — Voice Swap page](docs/voice-swap.jpg)
 
 | Piece | What it does |
 |---|---|
@@ -39,8 +41,8 @@ It asks before anything big, never uses sudo on macOS, and ends by starting the 
 By hand:
 
 ```bash
-git clone https://github.com/lalomorales22/voice-swap.git
-cd voice-swap
+git clone https://github.com/lalomorales22/toon-house.git
+cd toon-house
 php index.php
 ```
 
