@@ -1,0 +1,1 @@
+MediaPipe Tasks Vision 0.10.35 (Apache-2.0, Google). Models: pose_landmarker_full, face_landmarker (Apache-2.0).

@@ -3,3 +3,14 @@ jobs/
 voices/
 .DS_Store
 *.png
+toons/
+characters/
+renders/
+projects/
+settings.json
+avatars/
+scenes/
+music/
+games/
+buddies/
+nintendo-mold-wizard/
