@@ -33,7 +33,7 @@ brew install php ffmpeg python@3.11 git
 One line does it all (installs the tools above, clones the app, installs the engine, offers Ollama):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lalomorales22/voice-swap/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/lalomorales22/toon-house/main/install.sh | bash
 ```
 
 It asks before anything big, never uses sudo on macOS, and ends by starting the app. Flags: `--yes` (no questions), `--no-engine` (skip the ~3 GB engine download), `--ollama` (also set up a local model), `--dir <path>`. Already cloned? `./install.sh` works from inside the folder too.
