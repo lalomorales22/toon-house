@@ -6,6 +6,8 @@ Give it 10–30 seconds of you talking (or singing) and a target track (e.g. a S
 
 Everything is one file: **`index.php`**. The first time you open it, it installs its own engine next to itself.
 
+![Voice Swap — put your voice on any song](docs/voice-swap.jpg)
+
 | Piece | What it does |
 |---|---|
 | [Demucs](https://github.com/facebookresearch/demucs) (htdemucs) | Splits the song into vocals + instrumental |
@@ -61,11 +63,14 @@ The steps fold up (click a heading) and stay the way you left them. Pick a look 
 
 ## Toon Lab — make a cartoon lip-sync to audio
 
+![Toon Lab — a news anchor toon in the Comic style](docs/toon-lab.jpg)
+
 Click **🎬 Toon Lab** in the header (or **🎬 Animate** on any finished Voice Swap result).
 
 1. **Build your toon**:
    - **Art style**: Classic, Anime, Comic, Sketch, Clay, ASCII 3D, Matrix, Pixel, Neon, Noir, Blueprint or **Realistic 3D**. 🎲 rolls the style too.
    - **Realistic 3D** swaps the cartoon for a rigged 3D person rendered with [Three.js](https://threejs.org): real skin and hair, soft shadows, lip-sync from the same mouth shapes (Oculus visemes), blinking, eye darts, head nods and hand gestures. Pick the **3D person**. Hair, clothes and skin colors, glasses/shades, background, camera, subtitles and captions all still apply; props, hats and the cartoon face options don't.
+     ![Realistic 3D — a person built in Blender, in front of a generated scene picture, Studio theme](docs/realistic-3d.jpg)
      - Two ready-made people download on first use (~40 MB): Maya (MakeHuman, CC0) and Brooke (Ready Player Me, CC BY-NC: personal use).
      - **🧍 Build a new 3D person in Blender**: body, age, build (slim, average, athletic, heavy), height, ethnicity (face shape), skin tone (light to dark), hair and hair color, brows, eye color, outfit and shoes. It runs Blender in the background with the free [MPFB](https://static.makehumancommunity.org/mpfb.html) (MakeHuman) extension and the [TalkingHead](https://github.com/met4citizen/TalkingHead) rig and face shapes, and takes about 10 seconds. The first build installs MPFB into Blender and downloads ~280 MB of CC0 skins, hair and clothes. Presets are played by Marcus, Walter, Theo, Ken and Rosa when those exist.
      - Any GLB with a Mixamo-style skeleton and ARKit + Oculus viseme blend shapes works: drop it in `avatars/`. An optional `avatars/<name>.json` sets `label`, `mouth` (lip-sync strength) and `tongue`.
@@ -98,6 +103,8 @@ Click **🎬 Toon Lab** in the header (or **🎬 Animate** on any finished Voice
 
 ## Game Creator — your toons star in games you design
 
+![Game Creator — a platformer designed by the local model, running in the page](docs/game-creator.jpg)
+
 Click **🕹 Game Creator** in the header. Games run on a small engine built into the app: no game framework, no API, nothing to install. Every game is **one HTML file** with its sprites, backdrops, music and voice lines embedded, so it plays anywhere, offline.
 
 1. **Game**: a name, a genre, a line for the title screen.
@@ -106,13 +113,18 @@ Click **🕹 Game Creator** in the header. Games run on a small engine built int
    - **Vertical shooter**: fly up, hold Space to fire, X drops a bomb; waves of enemies, asteroids, mines and a boss.
    - **✨ Game Director**: describe the game in a sentence and your local model (Ollama) picks the genre, invents the cast as voxel buddies, lays out the stages and writes the voice lines. Then change anything.
 2. **Cast**: a hero, up to three enemies (each patrols, chases, flies or shoots) and an optional boss. Pick any toon saved in Toon Lab or a preset (they keep their art style in the game: anime, pixel, neon, clay…), a random toon, or a **voxel buddy**. Every character is rendered into a 7-frame sprite sheet: idle, walk, jump, hurt, win.
-   - **🧱 Voxel buddies**: type a sentence ("a chonky space penguin with a crown") and a chunky 3D character is built instantly from the words: species, color, vibe, size, mood and accessories. ↻ Reroll for another take, **✨ Ask the AI** to have your local model design the parts, 💾 Save to the library, ⬇ export a `.vox` for MagicaVoxel, Goxel or Blender. Adapted from [voxel-buddies](https://github.com/lalomorales22/voxel-buddies), with Ollama instead of a paid API.
+   - **🧱 Voxel buddies**: type a sentence ("a chonky space penguin with a crown") and a chunky 3D character is built instantly from the words: species, color, vibe, size, mood and accessories.
+
+     ![Voxel buddies — a chonky space penguin with a crown](docs/voxel-buddies.jpg)
+ ↻ Reroll for another take, **✨ Ask the AI** to have your local model design the parts, 💾 Save to the library, ⬇ export a `.vox` for MagicaVoxel, Goxel or Blender. Adapted from [voxel-buddies](https://github.com/lalomorales22/voxel-buddies), with Ollama instead of a paid API.
 3. **Stages**: up to 8. Each has a backdrop (any Toon Lab background, or a scene picture), a length, a challenge level, an optional key and door, an optional boss, and its own music track. **🎲 New layout** generates the level from a seed; then **paint** it: ground, platforms, coins, gems, spikes, springs, keys, doors, enemies, the boss, the start and the goal. Right-click erases.
 4. **Rules & feel**: lives, difficulty, how a stage is cleared (reach the goal, collect every coin, beat the boss, survive the clock), a time limit, gravity, jump and speed, and the win / game-over lines.
 5. **Audio**: sound effects are synthesized in the game (four styles: chip, arcade, soft, glitch; 🎲 gives any effect a different take). Music is any track in the `music/` library, and you can compose one with MusicGen right there. Voice lines are spoken in your saved voice (or the AI reader) at the start, on a win, on game over and when hurt.
 6. **Play & save**: **▶ Play it** runs the game in the page (keyboard and touch), **💾 Save** keeps it in the gallery, **⬇ Download** gives you the HTML file. Any saved game can be played, remixed or downloaded from the gallery.
 
 In a game: arrows / WASD move, Space or Z is the action, X the second action, Enter starts, P pauses, R restarts. Progress is checkpointed at each stage in the browser.
+
+![Sprite sheets — toons in five art styles and three voxel buddies, rendered into the 7 game frames](docs/sprite-sheets.jpg)
 
 The cartridge format and the cast / stages / rules model follow the Game-Maker app; the engine, level generators, sprite pipeline and sound synth are built into `index.php`.
 
