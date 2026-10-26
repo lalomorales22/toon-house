@@ -1,0 +1,4 @@
+interface:
+  display_name: "Toon Studio"
+  short_description: "Create local cartoon videos, episodes, games, and speech"
+  default_prompt: "Use $toon-studio to create a 30-second cartoon video with lip-sync and subtitles in my local Toon House app."
