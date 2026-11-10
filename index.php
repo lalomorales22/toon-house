@@ -49,6 +49,12 @@ define('SCENES', BASE . '/scenes');     // background pictures (uploaded or gene
 define('MUSIC', BASE . '/music');       // background music (uploaded or generated)
 define('GAMES', BASE . '/games');       // Game Creator: one folder per saved game (game.json, index.html, thumb.jpg)
 define('BUDDIES', BASE . '/buddies');   // voxel buddies (recipe json + thumbnail)
+define('CLIPS', BASE . '/clips');       // short AI video clips (Wan 2.2): looping backgrounds and B-roll
+define('SHOWS', BASE . '/shows');       // Showrunner: one folder per episode (spec, status, the scenes it rendered)
+define('RECIPES', BASE . '/recipes');   // reproducible Python scripts that drive the app (recipes/*.py)
+define('FOOTAGE', BASE . '/footage');   // Real Avatar: your green-screen clips, their index (pauses, key color, neutral frames) and contact sheets
+define('BROLL', BASE . '/broll');       // Real Avatar: screen recordings and other background videos
+define('REALS', BASE . '/reals');       // Real Avatar: one folder per video made (spec, status, the lip-synced avatar, diagnostics)
 define('SETTINGS', BASE . '/settings.json');
 define('SYS_PATH', '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin');
 
@@ -185,7 +191,8 @@ function job_info(string $id): ?array {
 function write_engine_files(): void {
     @mkdir(ENGINE, 0755, true);
     $install = str_replace(['__REPO__', '__COMMIT__'], [SEEDVC_REPO, SEEDVC_COMMIT], INSTALL_SH);
-    foreach (['worker.py' => WORKER_PY, 'install.sh' => $install, 'gen.py' => GEN_PY] as $f => $src) {
+    $extras = str_replace(['__LIPSYNC_REPO__', '__LIPSYNC_COMMIT__'], [LIPSYNC_REPO, LIPSYNC_COMMIT], EXTRAS_SH);
+    foreach (['worker.py' => WORKER_PY, 'install.sh' => $install, 'gen.py' => GEN_PY, 'extras.sh' => $extras] as $f => $src) {
         $p = ENGINE . "/$f";
         if (!is_file($p) || md5_file($p) !== md5($src)) file_put_contents($p, $src);
     }
@@ -193,7 +200,7 @@ function write_engine_files(): void {
 
 function spawn_worker(string $dir, string $flag = ''): void {
     // subshell + exec: the PID we record is the python process itself, and no fd keeps this request open
-    $cmd = '(cd ' . escapeshellarg(ENGINE) . ' && exec nohup env PATH=' . escapeshellarg(SYS_PATH)
+    $cmd = '(cd ' . escapeshellarg(ENGINE) . ' && for fd in 3 4 5 6 7 8 9; do eval "exec $fd>&-"; done && exec nohup env PATH=' . escapeshellarg(SYS_PATH)
         . ' ./venv/bin/python worker.py ' . ($flag ? "$flag " : '') . escapeshellarg($dir)
         . ') < /dev/null > ' . escapeshellarg("$dir/log.txt") . ' 2>&1 & echo $!';
     file_put_contents("$dir/pid", trim((string)shell_exec($cmd)));
@@ -245,7 +252,45 @@ function voice_file(string $name): ?string {
         if (strcasecmp(basename($f), $name) === 0 || strcasecmp(pathinfo($f, PATHINFO_FILENAME), $name) === 0 || slug(pathinfo($f, PATHINFO_FILENAME)) === slug($name)) return $f;
     return null;
 }
-function tts_voice(string $v): string { return in_array($v, array_column(TTS_VOICES, 0), true) ? $v : 'am_michael'; }
+// Reader voices: Kokoro (built in) plus any speech model pulled into Ollama (e.g. "ollama pull phonon"). Ollama voice ids look like
+// "ollama/phonon:latest/Alfie": the model, then the voice name. The worker speaks them through Ollama's /v1/audio/speech endpoint.
+function ollama_url(): string { $s = settings(); return $s['provider'] === 'ollama' ? llm_base($s) : 'http://127.0.0.1:11434'; }
+function ollama_voices(bool $fresh = false): array {   // [[id, label, model], …], cached for a minute (one /api/show per speech model)
+    static $mem = null;
+    if ($mem !== null && !$fresh) return $mem;
+    $cache = ENGINE . '/.ollama_voices.json';
+    if (!$fresh && is_file($cache) && filemtime($cache) > time() - 60) return $mem = read_json($cache)['voices'] ?? [];
+    $out = []; $base = ollama_url();
+    [$code, $r] = http_req("$base/api/tags", null, 3);
+    foreach ($code === 200 ? ($r['models'] ?? []) : [] as $m) {
+        if (!in_array('speech', $m['capabilities'] ?? [], true) && !str_contains(strtolower($m['details']['family'] ?? ''), 'tts')) continue;
+        [$c2, $info] = http_req("$base/api/show", ['model' => $m['name']], 6);
+        if ($c2 !== 200 || !in_array('speech', $info['capabilities'] ?? [], true)) continue;
+        $short = preg_replace('/:latest$/', '', $m['name']);
+        foreach ($info['voices'] ?? ['default'] as $v) $out[] = ["ollama/{$m['name']}/$v", "$v · $short", $m['name']];
+    }
+    @mkdir(ENGINE, 0755, true);
+    @file_put_contents($cache, json_encode(['voices' => $out]));
+    return $mem = $out;
+}
+function tts_voice(string $v): string {
+    if (in_array($v, array_column(TTS_VOICES, 0), true)) return $v;
+    if (preg_match('#^ollama/[\w.:@-]+/[^/]{1,80}$#u', $v)) return $v;   // checked at speaking time: the model may have been pulled after the page loaded
+    return 'am_michael';
+}
+function tts_voice_options(): string {   // <option>s for the Reader dropdowns: Kokoro first, then one group per Ollama speech model
+    $h = '<optgroup label="Kokoro (built in)">';
+    foreach (TTS_VOICES as [$v, $l]) $h .= "<option value=\"$v\">$l</option>";
+    $h .= '</optgroup>';
+    $groups = [];
+    foreach (ollama_voices() as [$id, $label, $model]) $groups[$model][] = [$id, preg_replace('/ · .*$/', '', $label)];
+    foreach ($groups as $model => $vs) {
+        $h .= '<optgroup label="' . htmlspecialchars("Ollama · $model (installed on this Mac)") . '">';
+        foreach ($vs as [$id, $l]) $h .= '<option value="' . htmlspecialchars($id) . '">' . htmlspecialchars($l) . '</option>';
+        $h .= '</optgroup>';
+    }
+    return $h;
+}
 
 // ── toon specs (from the page, the Director or an agent) → always validated here ──
 function clampf($v, float $lo, float $hi, float $def): float { return is_numeric($v) ? max($lo, min($hi, (float)$v)) : $def; }
@@ -314,9 +359,22 @@ const PERSON_OPTS = [
         ['male_elegantsuit01', 'Black suit + tie'], ['male_worksuit01', 'Overalls'], ['female_casualsuit01', 'Fitted tee + jeans'],
         ['female_casualsuit02', 'Tee + denim shorts'], ['female_elegantsuit01', 'Blouse + skirt'], ['female_sportsuit01', 'Crop top + leggings']]],
     ['shoes', 'Shoes', [['shoes01', '1'], ['shoes02', '2'], ['shoes03', '3'], ['shoes04', '4'], ['shoes05', '5'], ['shoes06', '6'], ['none', 'Barefoot']]],
+    ['glasses', 'Glasses', [['none', 'None'], ['frames', 'Black frames']]],
+    ['outfitColor', 'Outfit color', [['', 'As made'], ['#16161a', 'Black'], ['#3a3d45', 'Charcoal'], ['#1f2a44', 'Navy'], ['#e8e6e0', 'White'], ['#7a1f24', 'Red'], ['#2f5d3a', 'Green']]],
 ];
 const PERSON_DEFAULT = ['name' => '', 'body' => 'man', 'age' => 28, 'build' => 'average', 'height' => 'average', 'ethnicity' => 'caucasian',
-    'tone' => 'auto', 'hair' => 'short02', 'hairColor' => '#3b2416', 'eyebrows' => 'eyebrow001', 'eyes' => 'brown', 'outfit' => 'male_casualsuit04', 'shoes' => 'shoes01'];
+    'tone' => 'auto', 'hair' => 'short02', 'hairColor' => '#3b2416', 'eyebrows' => 'eyebrow001', 'eyes' => 'brown', 'outfit' => 'male_casualsuit04', 'shoes' => 'shoes01', 'glasses' => 'none', 'outfitColor' => '', 'photo' => ''];
+define('PERSON_PHOTOS', AVATARS . '/.photos');   // front photos uploaded for a likeness; each is deleted once its person is built
+function person_photo(string $p): string {   // the likeness photo: an uploaded one (by its name) or an absolute path. '' when it isn't a picture we can use
+    if ($p === '') return '';
+    if (preg_match('/^[\w.-]+\.(jpe?g|png|webp)$/i', $p)) $p = PERSON_PHOTOS . "/$p";
+    $r = realpath($p);
+    return $r !== false && is_file($r) && preg_match('/\.(jpe?g|png|webp)$/i', $r) && filesize($r) <= 40e6 && @getimagesize($r) ? $r : '';
+}
+function person_check($in): ?string {   // what is wrong with a builder request, in words (null = fine)
+    if (is_array($in) && trim((string)($in['photo'] ?? '')) !== '' && person_photo((string)$in['photo']) === '') return 'The photo must be a JPG, PNG or WebP picture on this Mac (an absolute path, up to 40 MB).';
+    return null;
+}
 // MakeHuman's weight/muscle macros alone barely change the silhouette (a few mm), so each build also dials in body-part shapes
 const PERSON_BUILD_SHAPES = [
     'slim' => ['measure-waist-circ-decr' => 0.6, 'stomach-pregnant-decr' => 0.4, 'torso-scale-horiz-decr' => 0.25, 'hip-scale-horiz-decr' => 0.2,
@@ -349,6 +407,9 @@ function person_normalize($in): array {   // the builder's choices, cleaned up
         elseif (in_array($in[$k], array_column($spec, 0), true)) $out[$k] = $in[$k];
     }
     if (preg_match('/^#[0-9a-f]{6}$/i', (string)($in['hairColor'] ?? ''))) $out['hairColor'] = strtolower($in['hairColor']);   // any color, not just the chips
+    if (preg_match('/^#[0-9a-f]{6}$/i', (string)($in['outfitColor'] ?? ''))) $out['outfitColor'] = strtolower($in['outfitColor']);
+    $out['photo'] = person_photo((string)($in['photo'] ?? ''));   // a front photo of a real face, painted onto the skin
+    if (!empty($in['replace'])) $out['replace'] = true;           // rebuild the person of the same name in place (the old file is kept in the build folder)
     return $out;
 }
 function person_blender_spec(array $p): array {   // builder choices → MakeHuman macro sliders and asset names
@@ -367,7 +428,8 @@ function person_blender_spec(array $p): array {   // builder choices → MakeHum
     return ['name' => $p['name'] ?: 'Person', 'gender' => ['man' => 1, 'woman' => 0, 'neutral' => 0.5][$p['body']], 'age' => round($age, 3),
         'weight' => $weight, 'muscle' => $muscle, 'height' => ['short' => 0.3, 'average' => 0.5, 'tall' => 0.78][$p['height']], 'race' => $race,
         'skin' => $skin, 'skin_tint' => $tint, 'targets' => (object)$targets, 'hair' => $p['hair'] === 'none' ? '' : $p['hair'], 'eyebrows' => $p['eyebrows'], 'eyes' => $p['eyes'],
-        'clothes' => array_values(array_filter([$p['outfit'], $p['shoes'] === 'none' ? '' : $p['shoes']])), 'data' => PERSON_DATA];
+        'clothes' => array_values(array_filter([$p['outfit'], $p['shoes'] === 'none' ? '' : $p['shoes']])), 'data' => PERSON_DATA,
+        'glasses' => $p['glasses'] === 'frames', 'outfit_color' => $p['outfitColor'] !== '' ? array_map(fn($h) => round(hexdec($h) / 255, 4), str_split(substr($p['outfitColor'], 1), 2)) : null];
 }
 function person_id(string $name): string {
     $base = trim(preg_replace('/[^a-z0-9]+/', '-', strtolower($name)), '-') ?: 'person';
@@ -402,25 +464,34 @@ function media_name(string $title, string $ext, string $dir): string {   // "rai
     $slug = trim(preg_replace('/[^a-z0-9]+/', '-', strtolower(mb_substr($title, 0, 40))), '-') ?: 'item';
     return "$slug-" . bin2hex(random_bytes(2)) . ".$ext";
 }
-function scene_generate(string $prompt, string $aspect = '16:9', string $style = '', string $provider = 'hf'): array {
+function scene_generate(string $prompt, string $aspect = '16:9', string $style = '', string $provider = 'hf', bool $wait = true): array {
     @mkdir(SCENES, 0755, true);
     [$w, $h] = ['16:9' => [1280, 720], '9:16' => [720, 1280], '1:1' => [1024, 1024]][$aspect] ?? [1280, 720];
+    if ($provider === 'local') [$w, $h] = ['16:9' => [1024, 576], '9:16' => [576, 1024], '1:1' => [768, 768]][$aspect] ?? [1024, 576];   // Z-Image Turbo on an M-series Mac: ~1.5 min at this size, ~2.5 min at 720p
     $full = trim($prompt) . ', ' . (SCENE_STYLE[$style] ?? 'cinematic') . ', an empty deserted place with nobody in it, wide establishing shot, background plate, highly detailed';
     $file = media_name($prompt, 'jpg', SCENES); $out = SCENES . "/$file";
+    $meta = ['title' => mb_substr(trim($prompt), 0, 60), 'prompt' => $prompt, 'aspect' => $aspect,
+        'source' => ['free' => 'Pollinations (FLUX)', 'local' => 'Z-Image Turbo (made here)'][$provider] ?? 'Hugging Face (FLUX.1-schnell)'];
     if ($provider === 'free') {   // Pollinations: free and keyless, lower quality, small watermark
         $ch = curl_init('https://image.pollinations.ai/prompt/' . rawurlencode($full) . "?width=$w&height=$h&nologo=true&model=flux&seed=" . random_int(1, 999999));
         curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 120, CURLOPT_FOLLOWLOCATION => true, CURLOPT_NOSIGNAL => true]);
         $img = curl_exec($ch); $code = curl_getinfo($ch, CURLINFO_HTTP_CODE); $type = (string)curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
         if ($code !== 200 || !str_starts_with($type, 'image/')) throw new RuntimeException("The free image service didn't answer (HTTP $code). Try again in a minute, or use Hugging Face.");
         file_put_contents($out, $img);
+    } elseif ($provider === 'local') {   // Z-Image Turbo on this Mac, in the background (the page polls scene_status; agents wait here)
+        $id = paint_start($full, $w, $h, $out, 8);
+        file_put_contents(preg_replace('/\.jpg$/', '.json', $out), json_encode($meta, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+        if (!$wait) return $meta + ['file' => $file, 'job' => $id, 'time' => time()];
+        $st = tool_job_wait(SCENES . "/.jobs/$id", 1200);
+        if ($st['state'] !== 'done') { @unlink(preg_replace('/\.jpg$/', '.json', $out)); throw new RuntimeException($st['error'] ?? 'Painting failed.'); }
     } else {
         $r = gen_py(['image', $full, (string)$w, (string)$h, $out]);
         if (empty($r['ok'])) throw new RuntimeException($r['error'] ?? 'Image generation failed.');
     }
-    $meta = ['title' => mb_substr(trim($prompt), 0, 60), 'prompt' => $prompt, 'source' => $provider === 'free' ? 'Pollinations (FLUX)' : 'Hugging Face (FLUX.1-schnell)', 'aspect' => $aspect];
     file_put_contents(preg_replace('/\.jpg$/', '.json', $out), json_encode($meta, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
     return $meta + ['file' => $file, 'time' => time()];
 }
+function scene_provider(string $p): string { return in_array($p, ['local', 'hf', 'free'], true) ? $p : (painter_ready() ? 'local' : 'hf'); }   // the default painter: local when installed
 function media_import(string $src, string $dir, array $exts, string $title): ?string {   // copy a file the user or an agent points at into the library
     $ext = strtolower(pathinfo($src, PATHINFO_EXTENSION));
     if (!is_file($src) || !in_array($ext, $exts, true)) return null;
@@ -442,10 +513,388 @@ function music_start(string $prompt, float $seconds): array {
     file_put_contents("$d/job.json", json_encode(['prompt' => $prompt, 'seconds' => $seconds, 'out' => MUSIC . "/$file"]));
     file_put_contents(MUSIC . '/' . preg_replace('/\.mp3$/', '.json', $file), json_encode(['title' => mb_substr($prompt, 0, 60), 'prompt' => $prompt, 'source' => 'MusicGen (made here)'], JSON_UNESCAPED_UNICODE));
     write_engine_files();
-    $cmd = '(cd ' . escapeshellarg(ENGINE) . ' && exec nohup env -u HF_HOME PATH=' . escapeshellarg(SYS_PATH) . ' ./venv/bin/python gen.py music ' . escapeshellarg($d)
+    $cmd = '(cd ' . escapeshellarg(ENGINE) . ' && for fd in 3 4 5 6 7 8 9; do eval "exec $fd>&-"; done && exec nohup env -u HF_HOME PATH=' . escapeshellarg(SYS_PATH) . ' ./venv/bin/python gen.py music ' . escapeshellarg($d)
         . ') < /dev/null > ' . escapeshellarg("$d/log.txt") . ' 2>&1 & echo $!';
     file_put_contents("$d/pid", trim((string)shell_exec($cmd)));
     return ['id' => $id, 'file' => $file];
+}
+// ── optional extras next to the engine: a local painter (Z-Image Turbo through mflux, MLX) and local video (Wan 2.2 TI2V-5B through mlx-video) ──
+function tool_bin(string $name): ?string {   // uv installs tools into ~/.local/bin, which the app's PATH doesn't include
+    $home = getenv('HOME') ?: '';
+    foreach (["$home/.local/bin/$name", "/opt/homebrew/bin/$name", "/usr/local/bin/$name"] as $p) if (is_executable($p)) return $p;
+    $p = trim((string)shell_exec('PATH=' . escapeshellarg("$home/.local/bin:" . SYS_PATH) . ' command -v ' . escapeshellarg($name) . ' 2>/dev/null'));
+    return $p !== '' ? $p : null;
+}
+function paint_model(): string { return ENGINE . '/models/z-image-turbo-q8'; }
+function painter_ready(): bool { return tool_bin('mflux-generate-z-image-turbo') !== null && is_dir(paint_model()) && count(glob(paint_model() . '/*') ?: []) > 0; }
+function wan_model(): string { return ENGINE . '/models/wan22-ti2v-5b-mlx'; }
+function video_python(): string { return ENGINE . '/venv-video/bin/python'; }
+function video_ready(): bool { return is_executable(video_python()) && is_dir(wan_model()) && count(glob(wan_model() . '/*') ?: []) > 0; }
+function extras_status(): array {
+    $one = function (string $what, bool $ready): array {
+        $log = @file_get_contents(ENGINE . "/extras-$what.log") ?: '';
+        return ['ready' => $ready, 'installing' => pid_alive((int)@file_get_contents(ENGINE . "/extras-$what.pid")),
+            'log' => implode("\n", array_slice(explode("\n", preg_replace('/[^\n]*\r/', '', $log)), -12))];
+    };
+    return ['painter' => $one('painter', painter_ready()) + ['model' => 'Z-Image Turbo (6B, Apache-2.0), 8-bit for mflux', 'download' => '~7 GB download'],
+        'lipsync' => $one('lipsync', lipsync_ready()) + ['model' => 'MuseTalk 1.5 (MIT) through the musetalk-mac port, on the GPU (MPS)', 'download' => '~4 GB of weights + ~2 GB of Python packages'],
+        'video' => $one('video', video_ready()) + ['model' => 'Wan 2.2 TI2V-5B (Apache-2.0)', 'download' => '32 GB download (or point at a copy you already have), ~8 GB kept', 'checkpoint' => settings()['wan_checkpoint'] ?? ''],
+        'uv' => tool_bin('uv') !== null, 'free_gb' => round(disk_free_space(BASE) / 1e9, 1)];
+}
+function extras_install(string $what, string $checkpoint = ''): void {   // engine/extras.sh in the background; log + pid next to the engine
+    if (pid_alive((int)@file_get_contents(ENGINE . "/extras-$what.pid"))) return;
+    write_engine_files();
+    $home = getenv('HOME') ?: '';
+    $cmd = '(cd ' . escapeshellarg(ENGINE) . ' && for fd in 3 4 5 6 7 8 9; do eval "exec $fd>&-"; done && exec nohup env HOME=' . escapeshellarg($home) . ' PATH=' . escapeshellarg("$home/.local/bin:" . SYS_PATH) . ' bash extras.sh ' . escapeshellarg($what) . ' ' . escapeshellarg($checkpoint)
+        . ') < /dev/null > ' . escapeshellarg(ENGINE . "/extras-$what.log") . ' 2>&1 & echo $!';
+    file_put_contents(ENGINE . "/extras-$what.pid", trim((string)shell_exec($cmd)));
+}
+function tool_job_start(string $root, string $kind, array $job): string {   // gen.py <kind> <dir> in the background; progress lands in <dir>/status.json
+    @mkdir("$root/.jobs", 0755, true);
+    $id = new_id(); $d = "$root/.jobs/$id"; mkdir($d);
+    file_put_contents("$d/job.json", json_encode($job, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+    write_engine_files();
+    $home = getenv('HOME') ?: '';
+    $cmd = '(cd ' . escapeshellarg(ENGINE) . ' && for fd in 3 4 5 6 7 8 9; do eval "exec $fd>&-"; done && exec nohup env -u HF_HOME HOME=' . escapeshellarg($home) . ' PATH=' . escapeshellarg("$home/.local/bin:" . SYS_PATH) . ' ./venv/bin/python gen.py ' . escapeshellarg($kind) . ' ' . escapeshellarg($d)
+        . ') < /dev/null > ' . escapeshellarg("$d/log.txt") . ' 2>&1 & echo $!';
+    file_put_contents("$d/pid", trim((string)shell_exec($cmd)));
+    return $id;
+}
+function tool_job_status(string $d): array {
+    $st = read_json("$d/status.json") + ['state' => 'queued', 'stage' => 'Starting…', 'progress' => 0];
+    if (in_array($st['state'], ['queued', 'running'], true) && !pid_alive((int)@file_get_contents("$d/pid")) && filemtime($d) < time() - 5)
+        $st = ['state' => 'error', 'error' => substr((string)@file_get_contents("$d/log.txt"), -500) ?: 'Stopped unexpectedly.'] + $st;
+    return $st;
+}
+function tool_job_wait(string $d, int $seconds): array {
+    for ($i = 0; $i < $seconds; $i++) { $st = tool_job_status($d); if (in_array($st['state'], ['done', 'error'], true)) return $st; sleep(1); }
+    return ['state' => 'error', 'error' => 'Timed out.'] + tool_job_status($d);
+}
+function paint_start(string $prompt, int $w, int $h, string $out, int $steps = 9): string {
+    if (!painter_ready()) throw new RuntimeException('The local painter is not installed yet: Showrunner → Engines → Install the painter (a one-time ~7 GB download). Or pick Hugging Face / the free service.');
+    return tool_job_start(SCENES, 'paint', ['prompt' => $prompt, 'width' => $w, 'height' => $h, 'seed' => random_int(1, 999999), 'steps' => $steps, 'out' => $out,
+        'bin' => tool_bin('mflux-generate-z-image-turbo'), 'model' => paint_model()]);
+}
+function clip_start(string $prompt, string $image, string $aspect, float $seconds, int $steps = 20): array {   // a few seconds of Wan 2.2 video, from text or from a scene picture
+    if (!video_ready()) throw new RuntimeException('The video engine is not installed yet: Showrunner → Engines → Install video (Wan 2.2).');
+    @mkdir(CLIPS, 0755, true);
+    [$w, $h] = ['16:9' => [704, 384], '9:16' => [384, 704], '1:1' => [512, 512]][$aspect] ?? [704, 384];   // small on purpose: Wan 2.2 5B on an M-series Mac is slow, and the clip is stretched behind a toon anyway
+    $frames = (int)round(max(1, min(6, $seconds)) * 24 / 4) * 4 + 1;   // Wan wants 4n+1 frames at 24 fps
+    $title = $prompt !== '' ? $prompt : ($image !== '' ? 'animated ' . pathinfo($image, PATHINFO_FILENAME) : 'clip');
+    $file = media_name($title, 'mp4', CLIPS);
+    $img = $image !== '' && preg_match('/^[\w.-]+\.(jpe?g|png|webp)$/i', $image) && is_file(SCENES . "/$image") ? SCENES . "/$image" : '';
+    if ($image !== '' && $img === '') throw new RuntimeException("Scene picture not found: $image");
+    $full = $prompt;   // Wan holds on to a picture best when the prompt describes what is in it, then how it moves
+    if ($img !== '' && ($sp = trim((string)(read_json(preg_replace('/\.\w+$/', '.json', $img))['prompt'] ?? ''))) !== '' && stripos($prompt, mb_substr($sp, 0, 20)) === false)
+        $full = rtrim($sp, '. ') . ($prompt !== '' ? '. ' . $prompt : '. Gentle, steady camera motion, the scene stays the same.');
+    elseif ($full === '') $full = 'gentle natural motion, the scene stays the same, cinematic';
+    file_put_contents(CLIPS . '/' . preg_replace('/\.mp4$/', '.json', $file), json_encode(['title' => mb_substr($title, 0, 60), 'prompt' => $prompt, 'image' => $image, 'seconds' => round(($frames - 1) / 24, 1),
+        'aspect' => $aspect, 'source' => 'Wan 2.2 (made here)'], JSON_UNESCAPED_UNICODE));
+    $id = tool_job_start(CLIPS, 'clip', ['prompt' => $full, 'image' => $img, 'width' => $w, 'height' => $h, 'frames' => $frames, 'steps' => $steps, 'seed' => random_int(1, 999999),
+        'out' => CLIPS . "/$file", 'python' => video_python(), 'model_dir' => wan_model()]);
+    return ['id' => $id, 'file' => $file];
+}
+function clip_wait(string $id, int $seconds = 3600): string {   // the clip file, once a clip job is done
+    $st = tool_job_wait(CLIPS . "/.jobs/$id", $seconds);
+    if ($st['state'] !== 'done') throw new RuntimeException($st['error'] ?? 'The clip failed.');
+    return (string)$st['file'];
+}
+// ── Showrunner: an episode = title cards, talking scenes (Toon Lab specs) and B-roll clips, rendered in order and joined into one MP4 ──
+function show_normalize(array $ep): array {
+    $out = ['title' => mb_substr(trim((string)($ep['title'] ?? '')), 0, 80) ?: 'Episode', 'aspect' => in_array($ep['aspect'] ?? '', ['16:9', '9:16', '1:1'], true) ? $ep['aspect'] : '16:9',
+        'transition' => in_array($ep['transition'] ?? '', ['cut', 'fade'], true) ? $ep['transition'] : 'fade', 'bgm' => null, 'scenes' => []];
+    $b = $ep['bgm'] ?? null;
+    if (is_string($b) && trim($b) !== '') $out['bgm'] = is_file(MUSIC . '/' . basename($b)) ? ['file' => basename($b), 'volume' => 0.12] : ['prompt' => trim($b), 'volume' => 0.12];
+    elseif (is_array($b) && (!empty($b['file']) || !empty($b['prompt']))) $out['bgm'] = ['file' => basename((string)($b['file'] ?? '')), 'prompt' => (string)($b['prompt'] ?? ''), 'volume' => clampf($b['volume'] ?? 0.12, 0, 1, 0.12)];
+    foreach ((array)($ep['scenes'] ?? []) as $sc) {
+        if (!is_array($sc)) continue;
+        $k = $sc['kind'] ?? (isset($sc['script']) || isset($sc['audio']) ? 'talk' : (isset($sc['text']) ? 'title' : 'clip'));
+        if ($k === 'title') $out['scenes'][] = ['kind' => 'title', 'text' => mb_substr((string)($sc['text'] ?? $out['title']), 0, 60), 'sub' => mb_substr((string)($sc['sub'] ?? ''), 0, 80), 'seconds' => clampf($sc['seconds'] ?? 3, 1, 10, 3),
+            'color' => hexcol($sc['color'] ?? '', '#111118'), 'textColor' => hexcol($sc['textColor'] ?? '', '#ffd23f'),
+            'music' => is_string($sc['music'] ?? null) && trim($sc['music']) !== '' ? (is_file(MUSIC . '/' . basename($sc['music'])) ? ['file' => basename($sc['music'])] : ['prompt' => trim($sc['music'])]) : (is_array($sc['music'] ?? null) ? $sc['music'] : null),
+            'musicVolume' => clampf($sc['musicVolume'] ?? 0.8, 0, 1, 0.8)];   // an intro sting under the card: a track in music/, or a prompt to compose
+        elseif ($k === 'clip') { $c = ['kind' => 'clip', 'prompt' => mb_substr((string)($sc['prompt'] ?? ''), 0, 300), 'image' => basename((string)($sc['image'] ?? '')), 'clip' => basename((string)($sc['clip'] ?? '')), 'seconds' => clampf($sc['seconds'] ?? 3, 1, 6, 3)];
+            if ($c['prompt'] !== '' || $c['image'] !== '' || $c['clip'] !== '') $out['scenes'][] = $c; }
+        else {
+            $t = $sc; $t['kind'] = 'talk'; $t['script'] = trim((string)($t['script'] ?? '')); if ($t['script'] === '' && empty($t['audio'])) continue; unset($t['aspect'], $t['render']);
+            $name = trim((string)($t['name'] ?? ($t['character']['name'] ?? '') ?: (TOON_PRESETS[$t['preset'] ?? '']['name'] ?? '')));
+            if (!empty($t['name'])) { $t['character'] = (is_array($t['character'] ?? null) ? $t['character'] : []) + ['name' => $name]; $t['character']['name'] = $name; }
+            if ($name !== '' && !isset($t['captions'])) $t['captions'] = [['kind' => 'lower', 'text' => $name, 'start' => 0.6, 'end' => 5]];   // a name banner unless the scene brings its own captions
+            $out['scenes'][] = $t;
+        }
+        if (count($out['scenes']) >= 12) break;
+    }
+    if (!$out['scenes']) throw new RuntimeException('An episode needs at least one scene with something in it.');
+    return $out;
+}
+function show_director(string $prompt, string $model = ''): array {   // one sentence → a whole episode, from the local model
+    $presets = implode(', ', array_keys(TOON_PRESETS));
+    $styles = implode(', ', array_filter(array_column(TOON_SCHEMA[1][2], 0), fn($x) => $x !== 'real'));
+    $sys = "You are the showrunner of a short animated show made with Toon House. Turn the idea into an episode of 3 to 6 scenes, as JSON only.\n"
+        . "Scene kinds:\n- {\"kind\":\"title\",\"text\":\"BIG TITLE\",\"sub\":\"a subtitle\",\"seconds\":3} — a title card (start with one).\n"
+        . "- {\"kind\":\"talk\",\"preset\":<one of: $presets>,\"style\":<one of: $styles>,\"name\":\"character name\",\"script\":\"what they say\",\"scene\":\"the place behind them, no people\"} — a cartoon character talking to camera. "
+        . "Scripts: first person, 40-90 words, plain spoken sentences, no stage directions, no emoji, spell out numbers.\n"
+        . "- {\"kind\":\"clip\",\"prompt\":\"a few seconds of moving footage\",\"seconds\":3} — B-roll between talks (no people, describe motion).\n"
+        . "Alternate characters when two people talk. Keep the episode under three minutes. Also give title, aspect (16:9 for YouTube, 9:16 for Shorts) and bgm (a short description of background music, or empty).";
+    $schema = ['type' => 'object', 'required' => ['title', 'scenes'], 'properties' => ['title' => ['type' => 'string'], 'aspect' => ['type' => 'string', 'enum' => ['16:9', '9:16', '1:1']], 'bgm' => ['type' => 'string'],
+        'scenes' => ['type' => 'array', 'items' => ['type' => 'object', 'required' => ['kind'], 'properties' => ['kind' => ['type' => 'string', 'enum' => ['title', 'talk', 'clip']], 'text' => ['type' => 'string'], 'sub' => ['type' => 'string'],
+            'seconds' => ['type' => 'number'], 'preset' => ['type' => 'string'], 'style' => ['type' => 'string'], 'name' => ['type' => 'string'], 'script' => ['type' => 'string'], 'scene' => ['type' => 'string'], 'prompt' => ['type' => 'string']]]]]];
+    $msgs = [['role' => 'system', 'content' => $sys], ['role' => 'user', 'content' => $prompt]];
+    $text = llm_chat($msgs, $model, 600, $schema);
+    if (!preg_match('/\{.*\}/s', $text, $m) || !is_array($ep = json_decode($m[0], true)) || empty($ep['scenes'])) {   // a small model may trip over the strict schema: once more as free-form JSON
+        $text = llm_chat($msgs, $model, 600);
+        if (!preg_match('/\{.*\}/s', $text, $m) || !is_array($ep = json_decode($m[0], true))) throw new RuntimeException('The model did not answer with an episode. Try again, or pick a bigger model.');
+    }
+    foreach ($ep['scenes'] ?? [] as &$sc) if (is_array($sc) && ($sc['kind'] ?? '') === 'talk') { if (!isset(TOON_PRESETS[$sc['preset'] ?? ''])) $sc['preset'] = array_keys(TOON_PRESETS)[crc32((string)($sc['name'] ?? '')) % count(TOON_PRESETS)]; if (!in_array($sc['style'] ?? '', array_column(TOON_SCHEMA[1][2], 0), true)) unset($sc['style']); }
+    unset($sc);
+    return show_normalize($ep);
+}
+function show_start(array $in): string {
+    $ep = !empty($in['prompt']) && empty($in['scenes']) ? show_director((string)$in['prompt'], (string)($in['model'] ?? '')) : show_normalize($in);
+    foreach (['voice', 'tts_voice', 'style', 'subtitles', 'motion'] as $k) if (isset($in[$k])) foreach ($ep['scenes'] as &$sc) if ($sc['kind'] === 'talk' && !isset($sc[$k])) $sc[$k] = $in[$k];   // episode-wide defaults for the talk scenes
+    unset($sc);
+    @mkdir(SHOWS, 0755, true);
+    $id = new_id(); $d = SHOWS . "/$id"; mkdir($d, 0755, true);
+    if ($ep['bgm'] && empty($ep['bgm']['file']) && !empty($ep['bgm']['prompt']) && engine_ready()) { $m = music_start(mb_substr($ep['bgm']['prompt'], 0, 200), 30); $ep['bgm']['job'] = $m['id']; $ep['bgm']['file'] = $m['file']; }   // composes while the scenes render
+    foreach ($ep['scenes'] as &$sc) if ($sc['kind'] === 'title' && !empty($sc['music']['prompt']) && empty($sc['music']['file']) && engine_ready()) { $m = music_start(mb_substr($sc['music']['prompt'], 0, 200), (float)max(8, min(30, $sc['seconds'] + 4))); $sc['music']['job'] = $m['id']; $sc['music']['file'] = $m['file']; }
+    unset($sc);
+    $ep['_env'] = ['port' => (int)($_SERVER['SERVER_PORT'] ?? PORT), 'music' => MUSIC, 'renders' => RENDERS, 'clips' => CLIPS, 'created' => time()];
+    file_put_contents("$d/spec.json", json_encode($ep, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+    spawn_worker($d, '--show');
+    return $id;
+}
+function show_status(string $id): array {
+    $d = SHOWS . "/$id"; $st = tool_job_status($d); $ep = read_json("$d/spec.json");
+    $st += ['id' => $id, 'title' => $ep['title'] ?? '', 'aspect' => $ep['aspect'] ?? '16:9', 'time' => (int)($ep['_env']['created'] ?? filemtime($d)), 'scenes' => []];
+    if (!empty($st['render']) && is_file(RENDERS . '/' . $st['render'])) $st['render_url'] = '?a=render&f=' . rawurlencode($st['render']);
+    return $st;
+}
+function show_list(): array {
+    $out = [];
+    foreach (glob(SHOWS . '/*', GLOB_ONLYDIR) ?: [] as $d) { $st = show_status(basename($d)); $out[] = ['id' => $st['id'], 'title' => $st['title'], 'state' => $st['state'], 'stage' => $st['stage'], 'progress' => $st['progress'], 'time' => $st['time'], 'aspect' => $st['aspect'],
+        'render' => $st['render'] ?? null, 'render_path' => $st['render_path'] ?? null, 'render_url' => $st['render_url'] ?? null, 'scenes' => count(read_json("$d/spec.json")['scenes'] ?? [])]; }
+    usort($out, fn($a, $b) => $b['time'] <=> $a['time']);
+    return $out;
+}
+// ── every queue in one list (the Showrunner's Jobs panel, ?a=jobs_all) ──
+function jobs_all(): array {
+    $out = [];
+    $add = function (string $kind, string $id, string $title, array $st, int $time, array $extra = []) use (&$out) {
+        $out[] = ['kind' => $kind, 'id' => $id, 'title' => $title, 'state' => $st['state'] ?? 'queued', 'stage' => $st['stage'] ?? '', 'progress' => (float)($st['progress'] ?? 0), 'error' => $st['error'] ?? null, 'time' => $time] + $extra;
+    };
+    foreach (glob(JOBS . '/*', GLOB_ONLYDIR) ?: [] as $d) { $j = job_info(basename($d)); if (!$j) continue;
+        $add(!empty($j['job']['project']) || !empty($j['job']['game']) ? 'line' : (($j['job']['mode'] ?? '') === 'speech' ? 'speech' : 'song'), $j['id'], (string)($j['job']['title'] ?? ''), $j['status'], filemtime($d), ['files' => $j['status']['files'] ?? null]); }
+    foreach (glob(PROJECTS . '/*', GLOB_ONLYDIR) ?: [] as $d) { $st = tool_job_status($d); $sp = read_json("$d/spec.json");
+        $add('render', basename($d), (string)($sp['title'] ?? ''), $st, filemtime($d), ['render_path' => $st['render_path'] ?? null, 'render' => $st['render'] ?? null, 'link' => '?p=toon&make=' . basename($d) . '&manual=1']); }
+    foreach ([['music', MUSIC . '/.jobs', 'prompt'], ['scene', SCENES . '/.jobs', 'prompt'], ['clip', CLIPS . '/.jobs', 'prompt']] as [$kind, $root, $key])
+        foreach (glob("$root/*", GLOB_ONLYDIR) ?: [] as $d) { $st = tool_job_status($d); $j = read_json("$d/job.json"); $add($kind, basename($d), mb_substr((string)($j[$key] ?? ''), 0, 70), $st, filemtime($d), ['file' => basename((string)($j['out'] ?? ''))]); }
+    foreach (glob(AVATARS . '/.builds/*', GLOB_ONLYDIR) ?: [] as $d) { $st = tool_job_status($d); $sp = read_json("$d/spec.json"); $add('person', basename($d), (string)($sp['name'] ?? '3D person'), $st, filemtime($d), ['avatar' => $st['avatar'] ?? null]); }
+    foreach (glob(GAMES . '/.builds/*', GLOB_ONLYDIR) ?: [] as $d) { $st = game_build_status(basename($d)); $add('game', basename($d), (string)$st['title'], $st, filemtime($d), ['play_url' => $st['play_url'] ?? null, 'game_id' => $st['game_id'] ?? null]); }
+    foreach (show_list() as $sh) $add('show', $sh['id'], $sh['title'], $sh, $sh['time'], ['render_url' => $sh['render_url'], 'render_path' => $sh['render_path']]);
+    foreach (real_list() as $r) $add('avatar', $r['id'], $r['title'], $r, $r['time'], ['render_url' => $r['render_url'] ?? null, 'render_path' => $r['render_path'] ?? null]);
+    foreach ([FOOTAGE, BROLL] as $root) foreach (glob("$root/.jobs/*", GLOB_ONLYDIR) ?: [] as $d) { $st = tool_job_status($d); $j = read_json("$d/job.json"); $add('index', basename($d), basename((string)($j['file'] ?? '')), $st, filemtime($d)); }
+    usort($out, fn($a, $b) => $b['time'] <=> $a['time']);
+    return array_slice($out, 0, 80);
+}
+// ── recipes: the Python scripts in recipes/ (they drive this app through tools/toonhouse.py) ──
+function recipes_list(): array {
+    $out = [];
+    foreach (glob(RECIPES . '/*.py') ?: [] as $f) {
+        $src = (string)file_get_contents($f, false, null, 0, 6000);
+        $i = strpos($src, '"""'); $doc = $i !== false ? trim((string)strtok(substr($src, $i + 3), "\n")) : '';
+        $out[] = ['name' => basename($f, '.py'), 'file' => basename($f), 'doc' => $doc, 'cmd' => 'python3 recipes/' . basename($f)];
+    }
+    return $out;
+}
+function recipe_run(string $name, string $args): string {
+    $f = RECIPES . '/' . basename($name) . '.py';
+    if (!preg_match('/^[\w-]+$/', $name) || !is_file($f)) throw new RuntimeException('No such recipe.');
+    preg_match_all('/"([^"]*)"|\'([^\']*)\'|(\S+)/', $args, $m, PREG_SET_ORDER);
+    $argv = array_map(fn($x) => escapeshellarg($x[3] ?? ($x[2] !== '' ? $x[2] : $x[1])), $m);
+    @mkdir(RECIPES . '/.runs', 0755, true);
+    $id = new_id(); $d = RECIPES . "/.runs/$id"; mkdir($d);
+    file_put_contents("$d/job.json", json_encode(['recipe' => $name, 'args' => $args, 'started' => time()]));
+    $py = find_bin('python3') ?: 'python3';
+    $cmd = '(cd ' . escapeshellarg(BASE) . ' && for fd in 3 4 5 6 7 8 9; do eval "exec $fd>&-"; done && exec nohup env PATH=' . escapeshellarg(SYS_PATH) . ' TOONHOUSE_URL=' . escapeshellarg('http://127.0.0.1:' . (int)($_SERVER['SERVER_PORT'] ?? PORT))
+        . ' bash -c ' . escapeshellarg(escapeshellarg($py) . ' -u ' . escapeshellarg($f) . ' ' . implode(' ', $argv) . '; echo "__EXIT__ $?"') . ') < /dev/null > ' . escapeshellarg("$d/log.txt") . ' 2>&1 & echo $!';
+    file_put_contents("$d/pid", trim((string)shell_exec($cmd)));
+    return $id;
+}
+function recipe_status(string $id): array {
+    $d = RECIPES . "/.runs/$id"; $log = (string)@file_get_contents("$d/log.txt"); $j = read_json("$d/job.json");
+    $state = preg_match('/__EXIT__ (\d+)\s*$/', $log, $m) ? ((int)$m[1] === 0 ? 'done' : 'error') : (pid_alive((int)@file_get_contents("$d/pid")) ? 'running' : 'error');
+    return ['id' => $id, 'state' => $state, 'recipe' => $j['recipe'] ?? '', 'args' => $j['args'] ?? '', 'started' => $j['started'] ?? 0, 'log' => implode("\n", array_slice(explode("\n", preg_replace('/[^\n]*\r/', '', trim(preg_replace('/__EXIT__ \d+\s*$/', '', $log)))), -40))];
+}
+// ── Real Avatar: your own green-screen footage, lip-synced to your cloned voice, keyed and laid over a screen recording ──
+const LIPSYNC_REPO = 'https://github.com/barnent1/musetalk-mac.git';
+const LIPSYNC_COMMIT = '7fd019315127d7f31e2e7f9853547ddceabbeb6e';
+function lipsync_dir(): string { return ENGINE . '/musetalk-mac'; }
+function lipsync_python(): string { return ENGINE . '/venv-lipsync/bin/python'; }
+function lipsync_ready(): bool {
+    $m = lipsync_dir() . '/upstream/models';
+    return is_executable(lipsync_python()) && is_file(lipsync_dir() . '/upstream/scripts/inference.py') && is_file("$m/musetalkV15/unet.pth") && is_file("$m/face-parse-bisent/79999_iter.pth")
+        && is_file("$m/face-parse-bisent/resnet18-5c106cde.pth") && is_file("$m/whisper/config.json") && is_file("$m/sd-vae/config.json");
+}
+function real_fonts(): array {   // burned-in subtitles are drawn with Pillow, so they need font files; these ship with macOS (Linux: DejaVu / Liberation)
+    static $out = null;
+    if ($out !== null) return $out;
+    $c = ['Impact' => '/System/Library/Fonts/Supplemental/Impact.ttf', 'Arial Black' => '/System/Library/Fonts/Supplemental/Arial Black.ttf', 'Helvetica' => '/System/Library/Fonts/Helvetica.ttc',
+        'Avenir Next Condensed' => '/System/Library/Fonts/Avenir Next Condensed.ttc', 'Futura' => '/System/Library/Fonts/Supplemental/Futura.ttc', 'Phosphate' => '/System/Library/Fonts/Supplemental/Phosphate.ttc',
+        'Chalkboard' => '/System/Library/Fonts/Supplemental/Chalkboard.ttc', 'Comic Sans MS' => '/System/Library/Fonts/Supplemental/Comic Sans MS Bold.ttf', 'Trebuchet MS' => '/System/Library/Fonts/Supplemental/Trebuchet MS Bold.ttf',
+        'Verdana' => '/System/Library/Fonts/Supplemental/Verdana Bold.ttf', 'Copperplate' => '/System/Library/Fonts/Supplemental/Copperplate.ttc', 'Luminari' => '/System/Library/Fonts/Supplemental/Luminari.ttf',
+        'DejaVu Sans' => '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', 'Liberation Sans' => '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf'];
+    $out = [];
+    foreach ($c as $name => $path) if (is_file($path)) $out[$name] = $path;
+    return $out;
+}
+function footage_list(): array {
+    $out = [];
+    foreach (media_list(FOOTAGE, '/\.mp4$/i') as $m) {
+        $b = FOOTAGE . '/' . pathinfo($m['file'], PATHINFO_FILENAME);
+        $out[] = $m + ['index' => read_json("$b.index.json"), 'preview' => is_file("$b.preview.webm") ? basename("$b.preview.webm") : null, 'sheets' => array_map('basename', glob("$b.*.jpg") ?: [])];
+    }
+    return $out;
+}
+function broll_list(): array {
+    $out = [];
+    foreach (media_list(BROLL, '/\.mp4$/i') as $m) { $b = BROLL . '/' . pathinfo($m['file'], PATHINFO_FILENAME); $out[] = $m + ['index' => read_json("$b.index.json"), 'sheet' => is_file("$b.frames.jpg") ? basename("$b.frames.jpg") : null]; }
+    return $out;
+}
+function index_start(string $kind, string $file, array $key = []): string {   // gen.py index: pauses, key color, keyed preview and contact sheets (footage) · frames sheet and a free-corner check (broll)
+    $dir = $kind === 'footage' ? FOOTAGE : BROLL;
+    return tool_job_start($dir, 'index', ['file' => "$dir/$file", 'kind' => $kind, 'key' => array_filter($key, fn($v) => $v !== '' && $v !== null)]);
+}
+function video_import(string $src, string $dir, string $title, string $kind): array {   // normalize an uploaded video into footage/ (25 fps, mono) or broll/ (as is, ≤1080p), then index it in the background
+    @mkdir($dir, 0755, true);
+    if (!is_file($src)) throw new RuntimeException('Video not found.');
+    $title = trim($title) !== '' ? trim($title) : pathinfo($src, PATHINFO_FILENAME);
+    $file = media_name($title, 'mp4', $dir); $out = "$dir/$file";
+    $vf = $kind === 'footage' ? "scale='min(1920,iw)':-2,fps=25,format=yuv420p" : "scale='min(1920,iw)':-2,format=yuv420p";
+    exec('ffmpeg -y -v error -i ' . escapeshellarg($src) . ' -vf ' . escapeshellarg($vf) . ' -c:v libx264 -crf 17 -preset veryfast -c:a aac -ar 44100 ' . ($kind === 'footage' ? '-ac 1 ' : '') . '-movflags +faststart ' . escapeshellarg($out) . ' 2>&1', $o, $rc);
+    if ($rc !== 0 || !is_file($out)) throw new RuntimeException('Could not read that video: ' . implode(' ', array_slice($o, -2)));
+    $dur = (float)shell_exec('ffprobe -v error -show_entries format=duration -of csv=p=0 ' . escapeshellarg($out));
+    $meta = ['title' => mb_substr($title, 0, 60), 'source' => 'uploaded', 'duration' => round($dur, 2)];
+    file_put_contents(preg_replace('/\.mp4$/', '.json', $out), json_encode($meta, JSON_UNESCAPED_UNICODE));
+    return $meta + ['file' => $file, 'job' => index_start($kind, $file)];
+}
+function vision_models(): array {   // Ollama models that can look at pictures (the optional checks on the Real Avatar page)
+    $cache = ENGINE . '/.ollama_vision.json';
+    if (is_file($cache) && filemtime($cache) > time() - 120) return read_json($cache)['models'] ?? [];
+    $out = []; $base = ollama_url();
+    [$code, $r] = http_req("$base/api/tags", null, 3);
+    foreach ($code === 200 ? ($r['models'] ?? []) : [] as $m) {
+        if (isset($m['capabilities'])) { if (in_array('vision', $m['capabilities'], true)) $out[] = $m['name']; continue; }
+        [$c2, $info] = http_req("$base/api/show", ['model' => $m['name']], 5);
+        if ($c2 === 200 && in_array('vision', $info['capabilities'] ?? [], true)) $out[] = $m['name'];
+    }
+    @mkdir(ENGINE, 0755, true); @file_put_contents($cache, json_encode(['models' => $out]));
+    return $out;
+}
+function vision_check(string $image, string $question, string $model = ''): string {   // ask a local vision model about a picture (a contact sheet, a frame)
+    $s = settings();
+    if ($s['provider'] !== 'ollama') throw new RuntimeException('Picture checks need Ollama (⚙ Model server).');
+    $model = $model ?: (vision_models()[0] ?? '');
+    if ($model === '') throw new RuntimeException('No vision model in Ollama yet. Pull one, e.g.:  ollama pull minicpm-v');
+    if (!is_file($image)) throw new RuntimeException('Picture not found.');
+    [$code, $r, $err] = http_req(llm_base($s) . '/api/chat', ['model' => $model, 'stream' => false, 'messages' => [['role' => 'user', 'content' => $question, 'images' => [base64_encode((string)file_get_contents($image))]]], 'options' => ['temperature' => 0.2]], 300);
+    if ($code !== 200) throw new RuntimeException("The vision model didn't answer" . ($err ? " ($err)" : " (HTTP $code)") . '.');
+    return trim(preg_replace('/<think>.*?(<\/think>|$)/s', '', (string)($r['message']['content'] ?? '')));
+}
+function script_writer(string $notes, int $seconds = 45, string $tone = 'conversational', string $model = ''): string {   // rough notes → what you say to camera, first person
+    $words = max(40, (int)round($seconds * 2.6));
+    $sys = "You write what a creator says to camera in a short vertical video, from their rough notes. First person, $tone, like talking to a friend who asked. About $words words, which is roughly $seconds seconds out loud. "
+        . "Plain spoken sentences, one idea per sentence. No headings, no bullet points, no emoji, no hashtags, no stage directions, no quotation marks around it, no title. Spell out numbers and abbreviations the way they are said. Open with a hook, end on a clear last line. Answer with the script only.";
+    $text = trim(llm_chat([['role' => 'system', 'content' => $sys], ['role' => 'user', 'content' => $notes]], $model, 600, false));
+    $text = preg_replace('/^\s*(script|here(?:\'s| is)[^:\n]*)\s*:\s*/i', '', $text);
+    $text = trim(preg_replace('/^[#>*\-\s]+|[*_`]+/m', '', $text), " \n\"'");
+    if ($text === '') throw new RuntimeException('The model wrote nothing. Try again, or pick another model.');
+    return $text;
+}
+function real_spec(array $in): array {   // a loose request → a full, validated Real Avatar spec
+    $fo = (string)($in['footage'] ?? '');
+    if ($fo !== '' && !is_file(FOOTAGE . '/' . basename($fo))) {
+        if (is_file($fo)) $fo = video_import($fo, FOOTAGE, (string)($in['footage_title'] ?? ''), 'footage')['file'];   // an agent pointing at a clip on disk
+        else throw new RuntimeException("No footage called \"" . basename($fo) . "\" (see options → footage).");
+    } else $fo = basename($fo);
+    if ($fo === '') { $all = footage_list(); if (!$all) throw new RuntimeException('Upload a green-screen clip of yourself first (Real Avatar → 1 · My footage).'); $fo = $all[0]['file']; }
+    $br = (string)($in['broll'] ?? ''); $brKind = '';
+    if ($br !== '') {
+        $b = basename($br);
+        if (is_file(BROLL . "/$b")) { $br = $b; $brKind = 'video'; }
+        elseif (is_file(CLIPS . "/$b")) { $br = $b; $brKind = 'clip'; }
+        elseif (is_file(SCENES . "/$b")) { $br = $b; $brKind = 'image'; }
+        elseif (is_file($br)) {
+            $ext = strtolower(pathinfo($br, PATHINFO_EXTENSION));
+            if (in_array($ext, ['jpg', 'jpeg', 'png', 'webp'], true)) { $br = (string)media_import($br, SCENES, ['jpg', 'jpeg', 'png', 'webp'], (string)($in['broll_title'] ?? '')); $brKind = 'image'; }
+            else { $br = video_import($br, BROLL, (string)($in['broll_title'] ?? ''), 'broll')['file']; $brKind = 'video'; }
+        } else throw new RuntimeException("Background video not found: $br (see options → broll)");
+    }
+    $script = speakable((string)($in['script'] ?? ''));
+    $audio = (string)($in['audio'] ?? ''); $audio = $audio !== '' && is_file($audio) ? (string)realpath($audio) : '';
+    if ($script === '' && $audio === '') throw new RuntimeException('Give it a "script" (what you say) or an "audio" file of your voice.' . (!empty($in['audio']) ? ' Audio file not found: ' . $in['audio'] : ''));
+    $saved = toon_options()['saved_voices'];
+    $voice = array_key_exists('voice', $in) ? (string)$in['voice'] : (string)($saved[0] ?? '');   // your cloned voice by default: that is the point of a real avatar
+    $missing = $voice !== '' && !voice_file($voice) ? $voice : '';
+    $idx = read_json(FOOTAGE . '/' . pathinfo($fo, PATHINFO_FILENAME) . '.index.json');
+    $av = is_array($in['avatar'] ?? null) ? $in['avatar'] : [];
+    $k = is_array($in['key'] ?? null) ? $in['key'] : []; $ik = $idx['key'] ?? [];
+    $sub = is_array($in['subtitles'] ?? null) ? $in['subtitles'] : [];
+    $fonts = real_fonts(); $font0 = isset($fonts['Impact']) ? 'Impact' : (array_key_first($fonts) ?: '');
+    $aspect = in_array($in['aspect'] ?? '', ['16:9', '9:16', '1:1'], true) ? $in['aspect'] : '9:16';
+    $caps = [];
+    foreach ((array)($in['captions'] ?? []) as $c) {
+        if (!is_array($c) || trim((string)($c['text'] ?? '')) === '') continue;
+        $kind = in_array($c['kind'] ?? '', ['title', 'lower'], true) ? $c['kind'] : 'lower';
+        $caps[] = ['kind' => $kind, 'text' => mb_substr(trim((string)$c['text']), 0, 80), 'start' => clampf($c['start'] ?? 0, 0, 3600, 0), 'end' => clampf($c['end'] ?? 4, 0, 3600, 4),
+            'color' => hexcol($c['color'] ?? '', $kind === 'title' ? '#ffd23f' : '#e63946'), 'font' => isset($fonts[$c['font'] ?? '']) ? $c['font'] : $font0];
+    }
+    return [
+        'title' => mb_substr(trim((string)($in['title'] ?? '')), 0, 80) ?: ($script !== '' ? mb_substr(preg_replace('/\s+/', ' ', $script), 0, 40) : 'Real Avatar'),
+        'footage' => $fo, 'broll' => $br, 'broll_kind' => $brKind, 'bgColor' => hexcol($in['bgColor'] ?? '', '#101418'),
+        'fit' => in_array($in['fit'] ?? '', ['blur', 'cover', 'contain'], true) ? $in['fit'] : 'blur',
+        'script' => $script, 'audio' => $audio, 'voice' => $voice, 'voice_missing' => $missing, 'tts_voice' => tts_voice((string)($in['tts_voice'] ?? '')),
+        'speed' => clampf($in['speed'] ?? 1, 0.6, 1.6, 1), 'steps' => (int)clampf($in['steps'] ?? 25, 10, 50, 25), 'aspect' => $aspect,
+        'avatar' => ['corner' => in_array($av['corner'] ?? '', ['bl', 'br', 'tl', 'tr', 'bc', 'c'], true) ? $av['corner'] : 'bl', 'size' => clampf($av['size'] ?? ($aspect === '9:16' ? 0.4 : 0.45), 0.15, 1, 0.4),
+            'margin' => clampf($av['margin'] ?? 0.035, 0, 0.2, 0.035), 'mirror' => !empty($av['mirror']), 'shape' => in_array($av['shape'] ?? '', ['none', 'circle'], true) ? $av['shape'] : 'none',
+            'crop' => clampf($av['crop'] ?? 0.8, 0.3, 1, 0.8), 'res' => (int)clampf($av['res'] ?? 720, 480, 1080, 720)],
+        'key' => ['color' => hexcol($k['color'] ?? ($ik['color'] ?? ''), '#00ff00'), 'similarity' => clampf($k['similarity'] ?? ($ik['similarity'] ?? 0.12), 0.03, 0.5, 0.12),
+            'blend' => clampf($k['blend'] ?? ($ik['blend'] ?? 0.08), 0, 0.5, 0.08), 'despill' => clampf($k['despill'] ?? ($ik['despill'] ?? 0.6), 0, 1, 0.6),
+            'mode' => in_array($k['mode'] ?? ($ik['mode'] ?? ''), ['chroma', 'difference'], true) ? ($k['mode'] ?? $ik['mode']) : 'auto'],
+        'lipsync' => in_array($in['lipsync'] ?? '', ['auto', 'off'], true) ? $in['lipsync'] : 'auto',
+        'subtitles' => ['style' => in_array($sub['style'] ?? '', ['karaoke', 'subtitle', 'pop', 'off'], true) ? $sub['style'] : 'karaoke', 'font' => isset($fonts[$sub['font'] ?? '']) ? $sub['font'] : $font0,
+            'size' => clampf($sub['size'] ?? 1, 0.5, 2, 1), 'color' => hexcol($sub['color'] ?? '', '#ffffff'), 'hi' => hexcol($sub['hi'] ?? '', '#ffd23f'),
+            'pos' => in_array($sub['pos'] ?? '', ['auto', 'top', 'middle', 'bottom'], true) ? $sub['pos'] : 'auto', 'box' => ($sub['box'] ?? true) !== false],
+        'captions' => $caps, 'broll_audio' => clampf($in['broll_audio'] ?? 0.12, 0, 1, 0.12), 'bgm' => make_bgm($in['bgm'] ?? null), 'export_avatar' => !empty($in['export_avatar']),
+    ];
+}
+function real_start(array $in): string {
+    $spec = real_spec($in);
+    if ($spec['voice_missing'] !== '') throw new RuntimeException("No saved voice called \"{$spec['voice_missing']}\". Saved voices: " . (implode(', ', toon_options()['saved_voices']) ?: 'none yet — record one on the Voice Swap page'));
+    if ($spec['bgm'] && empty($spec['bgm']['file']) && !empty($spec['bgm']['prompt']) && engine_ready()) { $m = music_start(mb_substr($spec['bgm']['prompt'], 0, 200), 30); $spec['bgm']['job'] = $m['id']; $spec['bgm']['file'] = $m['file']; }
+    @mkdir(REALS, 0755, true);
+    $id = new_id(); $d = REALS . "/$id"; mkdir($d, 0755, true);
+    $spec['_env'] = ['port' => (int)($_SERVER['SERVER_PORT'] ?? PORT), 'jobs' => JOBS, 'toons' => TOONS, 'music' => MUSIC, 'renders' => RENDERS, 'footage' => FOOTAGE, 'broll' => BROLL, 'clips' => CLIPS, 'scenes' => SCENES,
+        'voice_path' => $spec['voice'] !== '' ? voice_file($spec['voice']) : '', 'ollama' => ollama_url(), 'fonts' => real_fonts(),
+        'lipsync' => lipsync_ready() ? ['python' => lipsync_python(), 'dir' => lipsync_dir()] : null, 'created' => time()];
+    file_put_contents("$d/spec.json", json_encode($spec, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+    spawn_worker($d, '--real');
+    return $id;
+}
+function real_status(string $id): array {
+    $d = REALS . "/$id"; $st = tool_job_status($d); $sp = read_json("$d/spec.json");
+    $st += ['id' => $id, 'title' => $sp['title'] ?? '', 'aspect' => $sp['aspect'] ?? '9:16', 'time' => (int)($sp['_env']['created'] ?? filemtime($d)), 'footage' => $sp['footage'] ?? '', 'broll' => $sp['broll'] ?? ''];
+    if (!empty($st['render']) && is_file(RENDERS . '/' . $st['render'])) $st['render_url'] = '?a=render&f=' . rawurlencode($st['render']);
+    $st['diagnostics'] = array_map(fn($f) => "reals/$id/" . basename($f), glob("$d/*.jpg") ?: []);
+    $st['avatar'] = is_file("$d/avatar.webm") ? "reals/$id/avatar.webm" : null;
+    $st['synced'] = is_file("$d/synced.mp4") ? "reals/$id/synced.mp4" : null;
+    if ($st['state'] === 'error') $st['log'] = substr(preg_replace('/[^\n]*\r/', '', (string)@file_get_contents("$d/log.txt")), -1500);
+    return $st;
+}
+function real_list(): array {
+    $out = [];
+    foreach (glob(REALS . '/*', GLOB_ONLYDIR) ?: [] as $d) { $st = real_status(basename($d)); unset($st['log']); $out[] = $st; }
+    usort($out, fn($a, $b) => $b['time'] <=> $a['time']);
+    return $out;
 }
 function news_search(string $q): array {
     $r = gen_py(['news', $q, '8']);
@@ -469,6 +918,104 @@ function news_article(string $url): string {   // the story's own text (paragrap
     return mb_substr(implode("\n", $text), 0, 7000);
 }
 // ── Game Creator: saved games, voxel buddies, and the two things the local model does for it ──
+// ── Game Creator for agents and scripts: a loose game spec (or one sentence) → voice lines → headless Chrome draws the sprites and writes games/<id> ──
+function saved_toon(string $name): ?array {   // a saved toon (characters/) or a preset, by name
+    foreach (glob(CHARS . '/*.json') ?: [] as $f) { $c = read_json($f); if ($c && (strcasecmp((string)($c['name'] ?? ''), $name) === 0 || slug((string)($c['name'] ?? '')) === slug($name) || basename($f, '.json') === slug($name))) return $c; }
+    $k = strtolower(trim($name));
+    if (isset(TOON_PRESETS[$k])) return TOON_PRESETS[$k] + TOON_DEFAULT + ['name' => $k];
+    foreach (TOON_PRESETS as $pk => $pr) if (strcasecmp((string)($pr['name'] ?? ''), $name) === 0) return $pr + TOON_DEFAULT;
+    return null;
+}
+function game_member($m, string $role): ?array {   // "a lava crab" | {toon: "hacker"} | {buddy: "…", name, behavior, hp} | an editor-shape member
+    if (is_string($m)) $m = $m !== '' ? ['buddy' => $m] : null;
+    if (!is_array($m)) return null;
+    if (isset($m['kind'])) return $m;
+    $out = ['name' => (string)($m['name'] ?? ''), 'speed' => clampf($m['speed'] ?? 1, 0.5, 2, 1)];
+    if ($role === 'hero') $out['jump'] = clampf($m['jump'] ?? 1, 0.5, 2, 1);
+    if ($role === 'enemy') $out['behavior'] = in_array($m['behavior'] ?? '', ['patrol', 'chase', 'fly', 'shoot'], true) ? $m['behavior'] : 'patrol';
+    if ($role === 'boss') $out['hp'] = (int)clampf($m['hp'] ?? 3, 1, 12, 3);
+    if (!empty($m['toon']) && ($c = saved_toon((string)$m['toon']))) {
+        unset($c['file']);
+        return $out + ['kind' => 'toon', 'char' => toon_normalize($c + ['prop' => 'none']) + ['name' => $c['name'] ?? ''], 'name' => $out['name'] ?: (string)($c['name'] ?? $m['toon'])];
+    }
+    $prompt = trim((string)($m['buddy'] ?? $m['prompt'] ?? $m['toon'] ?? $m['name'] ?? '')) ?: 'angry green slime';
+    return $out + ['kind' => 'buddy', 'buddy' => ['prompt' => $prompt, 'seed' => (int)($m['seed'] ?? (crc32($prompt) & 0x7fffffff))], 'name' => $out['name'] ?: ucfirst(mb_substr($prompt, 0, 30))];
+}
+function game_make_spec(array $in): array {   // loose spec → [editor spec, music prompt]; the page's normSpec fills whatever is left out
+    $bgs = array_column(toon_schema()[array_search('bg', array_column(toon_schema(), 0))][2], 0);
+    $spec = ['version' => 1, 'title' => mb_substr((string)($in['title'] ?? 'Toon Game'), 0, 40), 'pitch' => mb_substr((string)($in['pitch'] ?? ''), 0, 160),
+        'mold' => in_array($in['mold'] ?? '', ['platformer', 'topdown', 'shooter'], true) ? $in['mold'] : 'platformer', 'winText' => (string)($in['winText'] ?? ''), 'loseText' => (string)($in['loseText'] ?? '')];
+    $cast = is_array($in['cast'] ?? null) ? $in['cast'] : [];
+    $hero = game_member($cast['hero'] ?? $in['hero'] ?? null, 'hero') ?? game_member(['toon' => 'hacker'], 'hero');
+    $enemies = []; foreach ((array)($cast['enemies'] ?? $in['enemies'] ?? []) as $e) if (($m = game_member($e, 'enemy')) && count($enemies) < 3) $enemies[] = $m;
+    $boss = game_member($cast['boss'] ?? $in['boss'] ?? null, 'boss');
+    $spec['cast'] = ['hero' => $hero, 'enemies' => $enemies, 'boss' => $boss];
+    $lv = $in['levels'] ?? $in['stages'] ?? 3;
+    if (is_numeric($lv)) $lv = array_fill(0, max(1, min(8, (int)$lv)), []);
+    $levels = []; $i = 0;
+    foreach (is_array($lv) ? array_slice($lv, 0, 8) : [[]] as $l) {
+        $i++; $l = is_array($l) ? $l : ['name' => (string)$l];
+        $bg = (string)($l['bg'] ?? $l['background'] ?? 'sky'); $bgv = $l['bg'] ?? null;
+        if (is_array($bgv) && isset($bgv['kind'])) $bgo = $bgv;   // editor shape
+        elseif (preg_match('/\.(jpe?g|png|webp)$/i', $bg) && is_file(SCENES . '/' . basename($bg))) $bgo = ['kind' => 'scene', 'value' => basename($bg), 'color' => '#3a86ff'];
+        else $bgo = ['kind' => 'builtin', 'value' => in_array($bg, $bgs, true) && $bg !== 'image' ? $bg : ['sky', 'city', 'space', 'synthwave', 'hacker', 'stage', 'matrix', 'studio'][($i - 1) % 8], 'color' => hexcol($l['color'] ?? '', '#3a86ff')];
+        $levels[] = ['id' => $i, 'name' => mb_substr((string)($l['name'] ?? "Stage $i"), 0, 40), 'bg' => $bgo, 'music' => (string)($l['music'] ?? ''), 'length' => in_array($l['length'] ?? '', ['short', 'medium', 'long'], true) ? $l['length'] : 'medium',
+            'difficulty' => (int)clampf($l['difficulty'] ?? min(3, $i), 1, 3, 1), 'seed' => (int)($l['seed'] ?? random_int(1, 999999)), 'key' => !empty($l['key']) && $spec['mold'] !== 'shooter', 'boss' => !empty($l['boss']) && $boss !== null, 'map' => $l['map'] ?? null];
+    }
+    if ($boss && !array_filter($levels, fn($l) => $l['boss'])) $levels[count($levels) - 1]['boss'] = true;
+    $spec['levels'] = $levels;
+    $r = is_array($in['rules'] ?? null) ? $in['rules'] : [];
+    $spec['rules'] = ['lives' => (int)clampf($r['lives'] ?? 3, 1, 9, 3), 'difficulty' => in_array($r['difficulty'] ?? '', ['chill', 'normal', 'hard', 'brutal'], true) ? $r['difficulty'] : 'normal', 'gravity' => clampf($r['gravity'] ?? 1, 0.5, 2, 1),
+        'jump' => clampf($r['jump'] ?? 1, 0.5, 2, 1), 'speed' => clampf($r['speed'] ?? 1, 0.5, 2, 1), 'win' => in_array($r['win'] ?? '', ['goal', 'coins', 'boss', 'survive'], true) ? ($r['win'] === 'boss' && !$boss ? 'goal' : $r['win']) : 'goal', 'timeLimit' => (int)clampf($r['timeLimit'] ?? 0, 0, 600, 0)];
+    $audio = is_array($in['audio'] ?? null) ? $in['audio'] : [];
+    $music = $audio['music'] ?? $in['music'] ?? null; $musicPrompt = ''; $musicFile = '';
+    if (is_string($music) && $music !== '') { if (is_file(MUSIC . '/' . basename($music))) $musicFile = basename($music); else $musicPrompt = $music; }
+    elseif (is_array($music)) { if (!empty($music['file']) && is_file(MUSIC . '/' . basename($music['file']))) $musicFile = basename($music['file']); elseif (!empty($music['prompt'])) $musicPrompt = (string)$music['prompt']; }
+    $v = is_array($audio['voice'] ?? null) ? $audio['voice'] : (is_array($in['voice'] ?? null) ? $in['voice'] : []);
+    $saved = (string)($v['saved_voice'] ?? $in['voice_name'] ?? ''); $vf = $saved !== '' ? voice_file($saved) : null;
+    $lines = []; foreach (['start', 'win', 'lose', 'hurt'] as $k) $lines[$k] = mb_substr((string)(($v['lines'] ?? [])[$k] ?? $v[$k] ?? ''), 0, 160);
+    $spec['audio'] = ['sfxStyle' => in_array($audio['sfxStyle'] ?? $in['sfx'] ?? '', ['chip', 'arcade', 'soft', 'glitch'], true) ? ($audio['sfxStyle'] ?? $in['sfx']) : 'chip', 'sfx' => is_array($audio['sfx'] ?? null) ? $audio['sfx'] : [],
+        'music' => ['file' => $musicFile, 'volume' => clampf(is_array($music) ? ($music['volume'] ?? 0.5) : 0.5, 0, 1, 0.5)],
+        'voice' => ['saved_voice' => $vf ? basename($vf) : '', 'tts_voice' => tts_voice((string)($v['tts_voice'] ?? '')), 'lines' => $lines, 'files' => is_array($v['files'] ?? null) ? $v['files'] : []]];
+    return [$spec, $musicPrompt];
+}
+function game_build_start(array $in, string $model = ''): string {
+    @mkdir(GAMES . '/.builds', 0755, true);
+    $id = new_id(); $d = GAMES . "/.builds/$id"; mkdir($d, 0755, true);
+    $build = ['plan' => null, 'spec' => null, 'voice' => null, 'music_job' => null, 'music_file' => ''];
+    $musicPrompt = '';
+    if (!empty($in['prompt'])) {   // the local Director designs it (the page maps the plan the same way the ✨ button does)
+        $bgs = array_column(toon_schema()[array_search('bg', array_column(toon_schema(), 0))][2], 0);
+        $plan = game_director((string)$in['prompt'], $model, ['bgs' => $bgs]);
+        $build['plan'] = $plan;
+        $vf = !empty($in['voice']) ? voice_file((string)$in['voice']) : null;
+        if (!empty($in['voice']) && !$vf) throw new RuntimeException("No saved voice called \"{$in['voice']}\".");
+        $lines = []; foreach (['start', 'win', 'lose', 'hurt'] as $k) $lines[$k] = mb_substr((string)(($plan['voice'] ?? [])[$k] ?? ''), 0, 160);
+        $build['voice'] = ['saved_voice' => $vf ? basename($vf) : '', 'tts_voice' => tts_voice((string)($in['tts_voice'] ?? '')), 'lines' => $lines];
+        $musicPrompt = is_string($plan['music'] ?? null) ? trim($plan['music']) : '';
+        $title = (string)($plan['title'] ?? 'Toon Game');
+    } else {
+        [$spec, $musicPrompt] = game_make_spec($in);
+        $build['spec'] = $spec; $build['voice'] = $spec['audio']['voice'];
+        $title = $spec['title'];
+    }
+    if ($musicPrompt !== '' && engine_ready()) { $m = music_start(mb_substr($musicPrompt, 0, 200), 20); $build['music_job'] = $m['id']; $build['music_file'] = $m['file']; }
+    $vp = $build['voice']['saved_voice'] ?? '';
+    $build['title'] = $title;
+    $build['_env'] = ['port' => (int)($_SERVER['SERVER_PORT'] ?? PORT), 'chrome' => find_chrome(), 'jobs' => JOBS, 'music' => MUSIC, 'games' => GAMES, 'voice_path' => $vp !== '' && is_file(VOICES . "/$vp") ? VOICES . "/$vp" : '', 'ollama' => ollama_url()];
+    file_put_contents("$d/spec.json", json_encode($build, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+    spawn_worker($d, '--game');
+    return $id;
+}
+function game_build_status(string $id): array {
+    $d = GAMES . "/.builds/$id";
+    $st = read_json("$d/status.json") + ['state' => 'queued', 'stage' => 'Starting…', 'progress' => 0];
+    if (in_array($st['state'], ['queued', 'running'], true) && !pid_alive((int)@file_get_contents("$d/pid")) && filemtime($d) < time() - 5)
+        $st = ['state' => 'error', 'error' => 'Worker stopped unexpectedly. ' . substr((string)@file_get_contents("$d/log.txt"), -400)] + $st;
+    $st['id'] = $id; $st['title'] = read_json("$d/spec.json")['title'] ?? '';
+    if (!empty($st['game_id'])) { $st['play_url'] = 'http://127.0.0.1:' . (int)($_SERVER['SERVER_PORT'] ?? PORT) . "/games/{$st['game_id']}/index.html"; $st['path'] = GAMES . "/{$st['game_id']}/index.html"; }
+    return $st;
+}
 function game_list(): array {
     $out = [];
     foreach (glob(GAMES . '/*/game.json') ?: [] as $f) {
@@ -567,6 +1114,15 @@ function person_build(string $dir, bool $echo = false): array {
         @mkdir(PERSON_DATA, 0755, true); @mkdir(AVATARS, 0755, true);
         file_put_contents(ENGINE . '/person.py', PERSON_PY);
         $spec = person_blender_spec($p);
+        $spec['work'] = $dir;
+        if ($p['photo'] !== '') {   // likeness: MediaPipe (run through uv, in its own throwaway environment) lines the photo up with the built head
+            $uv = tool_bin('uv'); $model = BASE . '/vendor/mediapipe/models/face_landmarker.task';
+            if (!$uv) throw new RuntimeException('A photo likeness needs uv, which runs the face finder. Install it (brew install uv), then try again.');
+            if (!is_file($model)) throw new RuntimeException('The face finder model is missing (vendor/mediapipe/models/face_landmarker.task). Run the installer again.');
+            file_put_contents(ENGINE . '/likeness.py', LIKENESS_PY);
+            $spec['likeness'] = ['photo' => $p['photo'], 'glasses' => $p['glasses'] === 'frames', 'model' => $model,
+                'cmd' => [$uv, 'run', '-q', '--no-project', '--python', '3.11', '--with', 'mediapipe==' . LIKENESS_MEDIAPIPE, '--with', 'opencv-python-headless', '--with', 'scipy', 'python', ENGINE . '/likeness.py']];
+        }
         $run = function (array $extra, ?callable $line = null) use ($bl, $dir, $spec) {
             file_put_contents("$dir/blender.json", json_encode($spec + $extra, JSON_UNESCAPED_SLASHES));
             $h = popen('env PATH=' . escapeshellarg(SYS_PATH) . ' ' . escapeshellarg($bl) . ' -b --python-exit-code 1 -P ' . escapeshellarg(ENGINE . '/person.py')
@@ -601,17 +1157,25 @@ function person_build(string $dir, bool $echo = false): array {
                 rename(PERSON_DATA . "/$f.part", PERSON_DATA . "/$f");
             }
         }
-        $id = person_id($p['name'] ?: 'person');
-        $out = AVATARS . "/$id.glb";
-        [$rc, $need, $log] = $run(['out' => $out], fn($pct, $msg) => $st($msg, 0.1 + $pct / 100 * 0.88));
-        if ($rc !== 0 || !is_file($out)) {
+        $same = trim(preg_replace('/[^a-z0-9]+/', '-', strtolower($p['name'])), '-');
+        $replace = !empty($p['replace']) && $same !== '' && is_file(AVATARS . "/$same.glb") && !empty(avatar_meta($same)['made']);   // only people built here are ever replaced
+        $id = $replace ? $same : person_id($p['name'] ?: 'person');
+        $out = AVATARS . "/$id.glb"; $new = $replace ? "$dir/new.glb" : $out;
+        [$rc, $need, $log] = $run(['out' => $new], fn($pct, $msg) => $st($msg, 0.1 + $pct / 100 * 0.88));
+        if ($rc === 0 && is_file($new) && $replace) {   // keep the person it replaces, then swap the new one in
+            copy($out, "$dir/previous.glb"); @copy(AVATARS . "/$id.json", "$dir/previous.json");
+            rename($new, $out);
+        }
+        if ($rc !== 0 || !is_file($out) || ($replace && is_file($new))) {
             $err = preg_match_all('/^(?:Error|.*Error:|RuntimeError|SystemExit).*$/m', $log, $m) ? implode(' | ', array_slice(array_unique($m[0]), -2)) : 'see ' . "$dir/log.txt";
             throw new RuntimeException('Blender could not build the person: ' . $err);
         }
         @unlink(PERSON_DATA . '/makehuman_system_assets.zip');   // installed into MPFB's library now
         file_put_contents(AVATARS . "/$id.json", json_encode(['label' => $p['name'] ?: 'Person', 'license' => 'CC0 (MakeHuman assets, built with Blender + MPFB)',
-            'mouth' => 1.5, 'tongue' => 0.6, 'made' => $p], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
-        return $st('Done', 1, ['state' => 'done', 'avatar' => $id, 'label' => avatar_meta($id)['label'], 'path' => $out]);
+            'mouth' => 1.5, 'tongue' => 0.6, 'made' => array_diff_key(['photo' => $p['photo'] !== '' ? 'yes' : ''] + $p, ['replace' => 1])], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+        $up = realpath(PERSON_PHOTOS);   // an uploaded face photo has done its job. Only ever a file in the uploads folder: a photo given by path is the user's own file
+        if ($p['photo'] !== '' && $up !== false && dirname($p['photo']) === $up) @unlink($p['photo']);
+        return $st('Done', 1, ['state' => 'done', 'avatar' => $id, 'label' => avatar_meta($id)['label'], 'path' => $out, 'likeness' => $p['photo'] !== '', 'replaced' => $replace]);
     } catch (Throwable $e) {
         return $st('Failed', 1, ['state' => 'error', 'error' => $e->getMessage()]);
     }
@@ -640,9 +1204,11 @@ function toon_normalize($c): array {
     }
     $img = (string)($c['bgImage'] ?? '');   // a picture from scenes/ (bg "image")
     if (preg_match('/^[\w.-]+\.(jpe?g|png|webp)$/i', $img) && is_file(SCENES . "/$img")) $out['bgImage'] = $img;
+    elseif (preg_match('/^[\w.-]+\.mp4$/i', $img) && is_file(CLIPS . "/$img")) $out['bgImage'] = $img;   // a Wan clip from clips/ loops behind the toon
     if ($out['bg'] === 'image' && $out['bgImage'] === '') $out['bg'] = 'stage';
     $made = avatar_meta($out['avatar'])['made'] ?? null;   // a built 3D person brings its own hair color unless one was asked for
     if ($out['style'] === 'real' && !isset($c['hairColor']) && !empty($made['hairColor'])) $out['hairColor'] = $made['hairColor'];
+    if ($out['style'] === 'real' && !isset($c['acc']) && ($made['glasses'] ?? '') === 'frames' && !in_array('glasses', $out['acc'], true)) $out['acc'][] = 'glasses';   // and its glasses
     return $out;
 }
 function make_spec(array $s): array {
@@ -718,7 +1284,7 @@ function toon_options(): array {
         'character_defaults' => TOON_DEFAULT,
         'presets' => toon_presets(),
         'saved_voices' => array_map(fn($f) => pathinfo($f, PATHINFO_FILENAME), glob(VOICES . '/*')),
-        'tts_voices' => TTS_VOICES,
+        'tts_voices' => array_merge(TTS_VOICES, array_map(fn($v) => [$v[0], $v[1]], ollama_voices())),   // Kokoro ids, then "ollama/<model>/<voice>" for speech models pulled into Ollama
         'fonts' => array_column(TOON_FONTS, 0),
         'subtitle_styles' => SUB_STYLES,
         'caption_kinds' => array_keys(CAP_KINDS),
@@ -726,6 +1292,14 @@ function toon_options(): array {
         'cameras' => ['full', 'medium', 'close'],
         'renderer' => find_chrome() ? 'headless chrome' : 'none (install Google Chrome to render MP4s without a browser tab)',
         'scenes' => array_column(media_list(SCENES, '/\.(jpe?g|png|webp)$/i'), 'title', 'file'),   // character.bgImage = file (with bg "image")
+        'clips' => array_column(media_list(CLIPS, '/\.mp4$/i'), 'title', 'file'),   // character.bgImage = file too: a looping Wan 2.2 clip behind the toon
+        'scene_providers' => array_values(array_filter(['local' => painter_ready(), 'hf' => true, 'free' => true])) ? array_keys(array_filter(['local' => painter_ready(), 'hf' => true, 'free' => true])) : [],
+        'painter' => painter_ready() ? 'Z-Image Turbo (local)' : 'not installed (Showrunner → Engines)',
+        'lipsync' => lipsync_ready() ? 'MuseTalk 1.5 (local)' : 'not installed (Showrunner → Engines): Real Avatar videos use your footage as-is until then',
+        'footage' => array_column(footage_list(), 'title', 'file'),   // real_make: footage = file
+        'broll' => array_column(broll_list(), 'title', 'file'),       // real_make: broll = file (or a clip, a scene picture, or a path)
+        'real_fonts' => array_keys(real_fonts()),                    // real_make: subtitles.font / captions[].font
+        'video' => video_ready() ? 'Wan 2.2 TI2V-5B (local)' : 'not installed (Showrunner → Engines)',
         'music' => array_column(media_list(MUSIC, '/\.(mp3|wav|m4a|ogg|flac)$/i'), 'title', 'file'),   // bgm.file = file
         'avatars' => toon_avatars(true),   // the 3D people for style "real"; character.avatar = id
         'person_builder' => ['blender' => find_blender() !== null, 'options' => array_map(fn($r) => is_numeric($r[2][0]) ? ['min' => $r[2][0], 'max' => $r[2][1]] : array_column($r[2], 0),
@@ -791,13 +1365,14 @@ function llm_models(): array {
     if ($code !== 200) throw new RuntimeException("Can't reach the model server at $base" . ($err ? " ($err)" : " (HTTP $code)"));
     return array_map(fn($m) => ['id' => $m['id'], 'size' => ''], $r['data'] ?? []);
 }
-function llm_chat(array $messages, string $model = '', int $timeout = 600, ?array $schema = null): string {
+function llm_chat(array $messages, string $model = '', int $timeout = 600, $schema = null): string {   // $schema: null = any JSON, an array = that JSON shape, false = plain text
     $s = settings(); $base = llm_base($s);
     $model = $model ?: $s['llm_model'] ?: (llm_models()[0]['id'] ?? '');
     if ($model === '') throw new RuntimeException('No text model found. Pull one first, e.g.:  ollama pull qwen3.5:2b');
     $fail = fn($code, $r, $err) => new RuntimeException("The model \"$model\" didn't answer" . ($err ? " ($err)" : " (HTTP $code" . (isset($r['error']) ? ': ' . (is_string($r['error']) ? $r['error'] : json_encode($r['error'])) : '') . ')') . '.');
     if ($s['provider'] === 'ollama') {
-        $body = ['model' => $model, 'messages' => $messages, 'stream' => false, 'format' => $schema ?: 'json', 'think' => false, 'options' => ['temperature' => 0.8, 'num_ctx' => 8192]];
+        $body = ['model' => $model, 'messages' => $messages, 'stream' => false, 'format' => $schema ?: 'json', 'think' => false, 'options' => ['temperature' => 0.8, 'num_ctx' => 8192, 'num_predict' => 3000]];   // num_predict: a small model stuck in a loop stops in minutes, not hours
+        if ($schema === false) unset($body['format']);
         [$code, $r, $err] = http_req("$base/api/chat", $body, $timeout);
         if ($code === 400 && stripos(json_encode($r), 'think') !== false) { unset($body['think']); [$code, $r, $err] = http_req("$base/api/chat", $body, $timeout); }
         if ($code !== 200) throw $fail($code, $r, $err);
@@ -856,10 +1431,35 @@ function server_base(): string {
     $url = 'http://127.0.0.1:' . PORT;
     if (@fsockopen('127.0.0.1', PORT, $e, $s, 1)) return $url;
     fwrite(STDERR, "Starting the app server on $url …\n");
-    exec('nohup ' . escapeshellarg(PHP_BINARY) . ' -d upload_max_filesize=1G -d post_max_size=1G -d max_execution_time=0 -d memory_limit=512M -S 127.0.0.1:' . PORT . ' '
-        . escapeshellarg(__FILE__) . ' > /dev/null 2>&1 &');
+    exec('PHP_CLI_SERVER_WORKERS=8 nohup ' . escapeshellarg(PHP_BINARY) . ' -d upload_max_filesize=1G -d post_max_size=1G -d max_execution_time=0 -d memory_limit=512M -S 127.0.0.1:' . PORT . ' '
+        . escapeshellarg(__FILE__) . ' > ' . escapeshellarg(BASE . '/server.log') . ' 2>&1 &');   // 8 workers: the background workers call this server too, and a long request must not block them
     for ($i = 0; $i < 50; $i++) { usleep(100000); if (@fsockopen('127.0.0.1', PORT, $e, $s, 1)) return $url; }
     fwrite(STDERR, "Couldn't start the server. Run:  php index.php\n"); exit(1);
+}
+function http_form(string $url, array $fields, int $timeout = 600): array {   // multipart POST, like the page's forms
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => $timeout, CURLOPT_NOSIGNAL => true, CURLOPT_POST => true, CURLOPT_POSTFIELDS => $fields]);
+    $r = curl_exec($ch); $err = curl_error($ch);
+    if ($r === false) return ['error' => "Can't reach the app: $err"];
+    return json_decode((string)$r, true) ?: ['error' => 'Bad answer from the app: ' . substr((string)$r, 0, 300)];
+}
+function cli_flag(array &$args, string $name, $default = null) {   // --name value (removed from $args)
+    $i = array_search($name, $args, true);
+    if ($i === false) return $default;
+    $v = $args[$i + 1] ?? $default;
+    array_splice($args, $i, 2);
+    return $v;
+}
+function cli_poll(string $base, string $action, string $id, bool $wait): array {   // follow a job's status on stderr; returns the final status
+    $last = '';
+    for (;;) {
+        $s = http_json("$base/?a=$action&id=" . urlencode($id));
+        $line = sprintf('%3d%%  %s', round(($s['progress'] ?? 0) * 100), $s['stage'] ?? $s['state'] ?? '');
+        if ($line !== $last) { fwrite(STDERR, $line . "\n"); $last = $line; }
+        if (($s['state'] ?? '') === 'error') { fwrite(STDERR, 'FAILED: ' . ($s['error'] ?? '') . "\n"); exit(1); }
+        if (($s['state'] ?? '') === 'done' || !$wait) return $s;
+        sleep(2);
+    }
 }
 function http_json(string $url, ?string $json = null, int $timeout = 600): array {
     $ctx = stream_context_create(['http' => ['method' => $json === null ? 'GET' : 'POST', 'header' => "Content-Type: application/json\r\n", 'content' => $json ?? '',
@@ -881,7 +1481,8 @@ function cli_agent(string $cmd, array $args): void {
     if ($cmd === 'person') {   // build a new 3D person in Blender, right here (no server needed)
         $src = $args[0] ?? '-';
         $in = json_decode((string)($src === '-' ? stream_get_contents(STDIN) : @file_get_contents($src)), true);
-        if (!is_array($in)) { fwrite(STDERR, "Usage: php index.php person spec.json   (or - for stdin). Fields: " . implode(', ', array_column(PERSON_OPTS, 0)) . ", name\n"); exit(1); }
+        if (!is_array($in)) { fwrite(STDERR, "Usage: php index.php person spec.json   (or - for stdin). Fields: " . implode(', ', array_column(PERSON_OPTS, 0)) . ", name, photo (a front photo of the face), replace\n"); exit(1); }
+        if ($bad = person_check($in)) { fwrite(STDERR, "$bad\n"); exit(1); }
         $dir = AVATARS . '/.builds/' . new_id();
         @mkdir($dir, 0755, true);
         file_put_contents("$dir/spec.json", json_encode(person_normalize($in)));
@@ -892,6 +1493,60 @@ function cli_agent(string $cmd, array $args): void {
     $wait = in_array('--wait', $args, true);
     $args = array_values(array_filter($args, fn($a) => $a !== '--wait'));
     $base = server_base();
+    $out = fn($s) => print(json_encode($s, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n");
+    if ($cmd === 'extras') {   // extras  |  extras install painter|video|lipsync [checkpoint dir]
+        if (($args[0] ?? '') === 'install') { $r = http_form("$base/?a=extras_install", ['what' => $args[1] ?? '', 'checkpoint' => $args[2] ?? '']); if (!empty($r['error'])) { fwrite(STDERR, $r['error'] . "\n"); exit(1); } fwrite(STDERR, "Installing {$args[1]} in the background; watch it with: php index.php extras\n"); }
+        $out(http_json("$base/?a=extras")); return;
+    }
+    if ($cmd === 'paint') {   // paint "a rainy neon street" [--style comic] [--aspect 16:9] [--provider local|hf|free]
+        $style = cli_flag($args, '--style', 'classic'); $aspect = cli_flag($args, '--aspect', '16:9'); $prov = cli_flag($args, '--provider', '');
+        $prompt = trim(implode(' ', $args));
+        if ($prompt === '') { fwrite(STDERR, "Usage: php index.php paint \"a scene\" [--style comic] [--aspect 16:9] [--provider local|hf|free]\n"); exit(1); }
+        $r = http_form("$base/?a=scene_gen", ['prompt' => $prompt, 'style' => $style, 'aspect' => $aspect, 'provider' => $prov]);
+        if (!empty($r['error'])) { fwrite(STDERR, $r['error'] . "\n"); exit(1); }
+        if (!empty($r['job'])) { $s = cli_poll($base, 'scene_status', $r['job'], true); $r = $s + $r; }
+        $out(['file' => $r['file'], 'path' => SCENES . '/' . $r['file'], 'source' => $r['source'] ?? '']); return;
+    }
+    if ($cmd === 'clip') {   // clip "slow drift through a server room" [--image scene.jpg] [--seconds 3] [--aspect 16:9]
+        $image = cli_flag($args, '--image', ''); $secs = cli_flag($args, '--seconds', '3'); $aspect = cli_flag($args, '--aspect', '16:9');
+        $prompt = trim(implode(' ', $args));
+        $r = http_form("$base/?a=clip_gen", ['prompt' => $prompt, 'image' => basename($image), 'seconds' => $secs, 'aspect' => $aspect]);
+        if (!empty($r['error'])) { fwrite(STDERR, $r['error'] . "\n"); exit(1); }
+        fwrite(STDERR, "clip {$r['id']}\n");
+        $s = cli_poll($base, 'clip_status', $r['id'], true);
+        $out(['file' => $r['file'], 'path' => CLIPS . '/' . $r['file']]); return;
+    }
+    if ($cmd === 'speak') {   // speak "text" [--voice NAME] [--reader am_michael] [--speed 1.0]
+        $voice = cli_flag($args, '--voice', ''); $reader = cli_flag($args, '--reader', 'am_michael'); $speed = cli_flag($args, '--speed', '1');
+        $text = trim(implode(' ', $args)); if (is_file($text)) $text = (string)file_get_contents($text);
+        if ($text === '') { fwrite(STDERR, "Usage: php index.php speak \"text or file.txt\" [--voice NAME] [--reader am_michael] [--speed 1.0]\n"); exit(1); }
+        $f = ['text' => $text, 'tts_voice' => $reader, 'tts_speed' => $speed, 'mode' => 'speech', 'steps' => '25'];
+        if ($voice !== '') { $vf = voice_file($voice); if (!$vf) { fwrite(STDERR, "No saved voice called \"$voice\".\n"); exit(1); } $f += ['saved_voice' => basename($vf), 'clean_voice' => '1']; } else $f['ai_voice'] = '1';
+        $r = http_form("$base/?a=create", $f);
+        if (!empty($r['error'])) { fwrite(STDERR, $r['error'] . "\n"); exit(1); }
+        $id = $r['ids'][0]; $last = '';
+        for (;;) {
+            $j = null; foreach (http_json("$base/?a=jobs") as $x) if (($x['id'] ?? '') === $id) $j = $x;
+            $s = $j['status'] ?? ['state' => 'error', 'error' => 'job vanished'];
+            $line = sprintf('%3d%%  %s', round(($s['progress'] ?? 0) * 100), $s['stage'] ?? ''); if ($line !== $last) { fwrite(STDERR, "$line\n"); $last = $line; }
+            if ($s['state'] === 'error' || $s['state'] === 'cancelled') { fwrite(STDERR, 'FAILED: ' . ($s['error'] ?? '') . "\n"); exit(1); }
+            if ($s['state'] === 'done') { $mp3 = $s['files']['vocals'] ?? $s['files']['mix'] ?? ''; $out(['id' => $id, 'path' => JOBS . "/$id/$mp3"]); return; }
+            sleep(2);
+        }
+    }
+    if ($cmd === 'game' || $cmd === 'show' || $cmd === 'real') {   // game spec.json | --prompt "…"  ·  show episode.json | --prompt "…"  ·  real spec.json
+        if (($args[0] ?? '') === '--prompt') $spec = ['prompt' => implode(' ', array_slice($args, 1))];
+        else {
+            $src = $args[0] ?? '-';
+            $spec = json_decode((string)($src === '-' ? stream_get_contents(STDIN) : @file_get_contents($src)), true);
+            if (!is_array($spec)) { fwrite(STDERR, "Usage: php index.php $cmd spec.json [--wait]   (or - for stdin, or --prompt \"…\")\n"); exit(1); }
+        }
+        $r = http_json("$base/?a={$cmd}_make", json_encode($spec));
+        if (!empty($r['error'])) { fwrite(STDERR, $r['error'] . "\n"); exit(1); }
+        fwrite(STDERR, "$cmd {$r['id']}\n");
+        if (!$wait) { $out(['id' => $r['id'], 'status' => "php index.php status {$r['id']} --wait"]); return; }
+        $out(cli_poll($base, "{$cmd}_status", $r['id'], true)); return;
+    }
     if ($cmd === 'make') {
         if (($args[0] ?? '') === '--prompt') $spec = ['prompt' => implode(' ', array_slice($args, 1))];
         else {
@@ -903,22 +1558,14 @@ function cli_agent(string $cmd, array $args): void {
         }
         $r = http_json("$base/?a=make", json_encode($spec));
         if (!empty($r['error'])) { fwrite(STDERR, $r['error'] . "\n"); exit(1); }
-        echo "project {$r['id']}\n";
-        if (!$wait) { echo "check it:  php index.php status {$r['id']}  --wait\n"; return; }
+        fwrite(STDERR, "project {$r['id']}\n");   // stdout stays pure JSON for scripts
+        if (!$wait) { $out(['id' => $r['id'], 'status' => "php index.php status {$r['id']} --wait"]); return; }
         $args = [$r['id']];
     }
     $id = $args[0] ?? '';
-    if (!valid_id($id)) { fwrite(STDERR, "Usage: php index.php status <project-id> [--wait]\n"); exit(1); }
-    $last = '';
-    for (;;) {
-        $s = http_json("$base/?a=make_status&id=" . urlencode($id));
-        $line = sprintf('%3d%%  %s', round(($s['progress'] ?? 0) * 100), $s['stage'] ?? $s['state'] ?? '');
-        if ($line !== $last) { fwrite(STDERR, $line . "\n"); $last = $line; }
-        if (($s['state'] ?? '') === 'error') { fwrite(STDERR, 'FAILED: ' . ($s['error'] ?? '') . "\n"); exit(1); }
-        if (($s['state'] ?? '') === 'done' || !$wait) break;
-        sleep(2);
-    }
-    echo json_encode($s, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), "\n";
+    if (!valid_id($id)) { fwrite(STDERR, "Usage: php index.php status <id> [--wait]   (a make, game or show id)\n"); exit(1); }
+    $action = is_dir(GAMES . "/.builds/$id") ? 'game_status' : (is_dir(SHOWS . "/$id") ? 'show_status' : (is_dir(REALS . "/$id") ? 'real_status' : 'make_status'));
+    $out(cli_poll($base, $action, $id, $wait));
 }
 
 // ───────────────────────────── embedded engine files ─────────────────────────────
@@ -926,7 +1573,8 @@ const PERSON_PY = <<<'PY'
 # Blender + MPFB (MakeHuman) → a rigged GLB person with Oculus visemes + ARKit face shapes, ready for Toon Lab's Realistic 3D style.
 #   Blender -b -P person.py -- spec.json
 # spec: out, name, gender/age/muscle/weight/height/proportions (0..1), race {african, asian, caucasian}, skin, hair, eyebrows, eyes,
-#       clothes [...], data (folder with the asset-pack zips + TalkingHead rig files), check (only report what is missing)
+#       clothes [...], data (folder with the asset-pack zips + TalkingHead rig files), check (only report what is missing),
+#       work (folder for in-between pictures), glasses (build frames), outfit_color [r, g, b], likeness {photo, model, cmd [...], glasses}
 # Prints "PERSON <pct> <stage>" progress lines, "PERSON_NEED <thing>" when something has to be downloaded first.
 import bpy, sys, json, os, zipfile, shutil, importlib.util, addon_utils
 from importlib import import_module
@@ -1000,6 +1648,110 @@ if eyes and os.path.isfile(tex):
                 n.image = bpy.data.images.load(tex, check_existing=True)
 
 # ── export copy: baked body shape, Oculus visemes + ARKit face units (TalkingHead's refined targets on top), helpers removed ──
+def eye_centers(eo):   # the two eyeballs' centers (world), the character's right eye first (it is at -x)
+    co = [eo.matrix_world @ v.co for v in eo.data.vertices]
+    side = lambda s: [c for c in co if c.x * s > 0]
+    mid = lambda cs: sum(cs, cs[0] * 0) / len(cs)
+    return mid(side(-1)), mid(side(1))
+
+def diffuse_node(mat):
+    return next((n for n in mat.node_tree.nodes if n.type == 'TEX_IMAGE' and n.image and any(l.to_socket.name == 'Base Color' for l in n.outputs[0].links)), None)
+
+# ── outfit color: shift the outfit's texture so its average lands on the chosen color, folds and seams kept ──
+if spec.get('outfit_color'):
+    import numpy as np
+    tint = np.array(spec['outfit_color'][:3], np.float32)
+    for o in bpy.data.objects:
+        if o.type != 'MESH' or S.ObjectService.get_object_type(o) != 'Clothes' or any(s in o.name.lower() for s in ('shoe', 'boot')): continue
+        for slot in o.material_slots:
+            n = diffuse_node(slot.material) if slot.material and slot.material.node_tree else None
+            if not n: continue
+            img = n.image; w, h = img.size
+            px = np.empty(w * h * 4, np.float32); img.pixels.foreach_get(px); px = px.reshape(-1, 4)
+            lum = px[:, :3] @ np.array([0.2126, 0.7152, 0.0722], np.float32)
+            solid = px[:, 3] > 0.5
+            k = lum / max(float(lum[solid].mean()) if solid.any() else float(lum.mean()), 1e-4)
+            px[:, :3] = np.clip(k[:, None] ** 0.6 * tint[None, :], 0, 1)
+            new = bpy.data.images.new(img.name + '.tint', w, h, alpha=True)
+            new.pixels.foreach_set(px.ravel()); new.filepath_raw = os.path.join(spec['work'], f'outfit-{o.name}.png'); new.file_format = 'PNG'; new.save()
+            n.image = new
+
+# ── likeness: paint a real face onto the skin. A flat front render of this head and the photo are lined up point by point
+#    (MediaPipe + a spline, in likeness.py), then the photo is projected from the front and baked into the skin texture. ──
+lk = spec.get('likeness')
+if lk and eyes:
+    import subprocess, mathutils
+    say(47, 'Looking at your photo')
+    work = spec['work']; sc = bpy.context.scene
+    er, el = eye_centers(eyes); ipd = (el - er).length; mid = (el + er) / 2
+    size = ipd * 4.4; cz = mid.z - ipd * 0.35   # a square frame around the face
+    cam = bpy.data.objects.new('likeness-cam', bpy.data.cameras.new('likeness-cam')); sc.collection.objects.link(cam)
+    cam.data.type = 'ORTHO'; cam.data.ortho_scale = size; cam.location = (mid.x, mid.y - ipd * 20, cz); cam.rotation_euler = (1.5707963, 0, 0)
+    cam.data.clip_start = ipd * 0.1; cam.data.clip_end = ipd * 60
+    hidden = [o for o in bpy.data.objects if o.type == 'MESH' and S.ObjectService.get_object_type(o) in ('Hair', 'Clothes', 'Eyebrows', 'Eyelashes')]
+    for o in hidden: o.hide_render = True
+    sc.camera = cam; sc.render.engine = 'BLENDER_WORKBENCH'; sc.display.shading.light = 'FLAT'; sc.display.shading.color_type = 'TEXTURE'
+    sc.render.resolution_x = sc.render.resolution_y = 1024; sc.render.resolution_percentage = 100; sc.render.film_transparent = False
+    sc.view_settings.view_transform = 'Standard'; sc.render.image_settings.file_format = 'PNG'
+    sc.render.filepath = os.path.join(work, 'likeness-render.png')
+    bpy.ops.render.render(write_still=True)
+    for o in hidden: o.hide_render = False
+    warp = os.path.join(work, 'likeness-warp.png')
+    tint = spec.get('skin_tint') or [1, 1, 1]   # the chosen skin tone goes into the texture here, so the photo (a grey beard, say) keeps its own colors
+    r = subprocess.run(lk['cmd'] + [sc.render.filepath, lk['photo'], lk['model'], warp, 'glasses' if lk.get('glasses') else 'plain', ','.join(str(c) for c in tint)], capture_output=True, text=True)
+    try: res = json.loads(r.stdout.strip().splitlines()[-1])
+    except Exception: res = {'error': (r.stderr or r.stdout or 'no output').strip()[-300:]}
+    if res.get('error'): print('Error: likeness: ' + res['error'], flush=True); sys.exit(5)
+
+    say(50, 'Painting your face onto the skin')
+    me = basemesh.data; mat = basemesh.material_slots[0].material; nt = mat.node_tree; dn = diffuse_node(mat)
+    dg = bpy.context.evaluated_depsgraph_get(); ev = basemesh.evaluated_get(dg)
+    shown = [m for m in basemesh.modifiers if m.type in ('MASK', 'SUBSURF')]   # clothes hide skin under them: bake every texel anyway
+    vis = [m.show_render for m in shown]
+    for m in shown: m.show_viewport = m.show_render = False
+    dg.update(); ev = basemesh.evaluated_get(dg); em = ev.to_mesh()
+    orig_uv = me.uv_layers.active.name
+    uv = me.uv_layers.new(name='likeness', do_init=False)
+    x0, z0 = mid.x - size / 2, cz - size / 2; mw = basemesh.matrix_world
+    pos = [mw @ v.co for v in em.vertices]
+    for l in me.loops:
+        p = pos[l.vertex_index]; uv.data[l.index].uv = ((p.x - x0) / size, (p.z - z0) / size)
+    ev.to_mesh_clear()
+    me.uv_layers[orig_uv].active = True; me.uv_layers[orig_uv].active_render = True
+    N, L = nt.nodes, nt.links
+    tmp = []
+    def node(t, **kw):
+        n = N.new(t); tmp.append(n)
+        for k, v in kw.items(): setattr(n, k, v)
+        return n
+    photo = node('ShaderNodeTexImage', image=bpy.data.images.load(warp), extension='CLIP')
+    uvn = node('ShaderNodeUVMap', uv_map='likeness'); L.new(uvn.outputs['UV'], photo.inputs['Vector'])
+    geo = node('ShaderNodeNewGeometry'); sep = node('ShaderNodeSeparateXYZ'); L.new(geo.outputs['Normal'], sep.inputs[0])
+    face = node('ShaderNodeMapRange'); L.new(sep.outputs['Y'], face.inputs['Value'])   # only skin that faces the front (-Y)
+    face.inputs['From Min'].default_value = -0.12; face.inputs['From Max'].default_value = -0.5; face.inputs['To Min'].default_value = 0; face.inputs['To Max'].default_value = 1
+    mul = node('ShaderNodeMath', operation='MULTIPLY'); L.new(photo.outputs['Alpha'], mul.inputs[0]); L.new(face.outputs[0], mul.inputs[1])
+    tone = node('ShaderNodeVectorMath', operation='MULTIPLY'); L.new(dn.outputs['Color'], tone.inputs[0]); tone.inputs[1].default_value = [c ** 2.2 for c in tint]
+    mix = node('ShaderNodeMix', data_type='RGBA'); L.new(mul.outputs[0], mix.inputs['Factor']); L.new(tone.outputs[0], mix.inputs['A']); L.new(photo.outputs['Color'], mix.inputs['B'])
+    emi = node('ShaderNodeEmission'); L.new(mix.outputs['Result'], emi.inputs['Color'])
+    out = node('ShaderNodeOutputMaterial'); L.new(emi.outputs[0], out.inputs['Surface'])
+    old_out = next((n for n in N if n.type == 'OUTPUT_MATERIAL' and n.is_active_output and n is not out), None)
+    for n in N: n.select = False
+    out.is_active_output = True
+    w, h = dn.image.size
+    baked = bpy.data.images.new('likeness-skin', w, h, alpha=False)
+    target = node('ShaderNodeTexImage', image=baked); target.select = True; N.active = target
+    bpy.ops.object.select_all(action='DESELECT'); basemesh.select_set(True); bpy.context.view_layer.objects.active = basemesh
+    sc.render.engine = 'CYCLES'; sc.cycles.device = 'CPU'; sc.cycles.samples = 1; sc.render.bake.margin = 8
+    bpy.ops.object.bake(type='EMIT')
+    baked.filepath_raw = os.path.join(work, 'likeness-skin.png'); baked.file_format = 'PNG'; baked.save()
+    for n in tmp: N.remove(n)
+    if old_out: old_out.is_active_output = True
+    dn.image = baked
+    me.uv_layers.remove(me.uv_layers['likeness'])
+    for m, v in zip(shown, vis): m.show_viewport = m.show_render = v
+    bpy.data.objects.remove(cam, do_unlink=True)
+    spec['skin_tint'] = None   # already in the texture
+
 say(55, 'Adding the lip-sync face shapes')
 coll = bpy.data.collections.new('export'); bpy.context.scene.collection.children.link(coll)
 copy = S.ExportService.create_character_copy(basemesh, name_suffix='.export', place_in_collection=coll)
@@ -1028,6 +1780,64 @@ for o in keep: o.select_set(True)
 bpy.context.view_layer.objects.active = arm
 bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
 
+# ── glasses: plain acetate frames built to this face (width from the eyes, resting just in front of the brow), riding the head bone.
+#    The material is called "….glasses", which is what Toon Lab's Glasses / Shades switch shows and hides. ──
+if spec.get('glasses'):
+    import bmesh, math
+    from mathutils import Vector
+    eo = next((o for o in keep if o.type == 'MESH' and 'high-poly' in o.name.lower()), None)
+    body = next((o for o in keep if o.type == 'MESH' and o.name.endswith('.body')), None) or next(o for o in keep if o.type == 'MESH' and o.data.shape_keys)
+    if eo and 'Head' in arm.data.bones:
+        er, el = eye_centers(eo); d = (el - er).length; ez = (el.z + er.z) / 2; cx = (el.x + er.x) / 2
+        bw = body.matrix_world; pts = [bw @ v.co for v in body.data.vertices]
+        near = [p for p in pts if abs(p.z - ez) < d * 1.2 and p.y < el.y + d * 1.6]
+        front = min(p.y for p in near if abs(p.x - cx) < d * 0.9 and -d * 0.12 < p.z - ez < d * 0.3) - d * 0.03   # just clear of the brow and the bridge
+        halfw = max(abs(p.x - cx) for p in near if abs(p.z - ez) < d * 0.25 and p.y < el.y + d * 0.2)       # the temples of the head, at eye height
+        ear_y = max(p.y for p in near if abs(p.z - ez) < d * 0.3 and abs(p.x - cx) > halfw * 0.9) 
+        lw, lh, rim, dep, rad = d * 0.86, d * 0.64, d * 0.07, d * 0.07, d * 0.14
+        out_ = d * 0.06   # lenses sit a little wider than the pupils
+        bm = bmesh.new()
+        def rrect(w, h, r, n=5):   # a rounded rectangle, counter-clockwise, in x/z
+            out = []
+            for qx, qz, a0 in [(1, 1, 0), (-1, 1, 90), (-1, -1, 180), (1, -1, 270)]:
+                for i in range(n + 1):
+                    a = math.radians(a0 + 90 * i / n)
+                    out.append((qx * (w / 2 - r) + r * math.cos(a), qz * (h / 2 - r) + r * math.sin(a)))
+            return out
+        def ring(ox, oz):
+            o_, i_ = rrect(lw + rim * 2, lh + rim * 2, rad + rim), rrect(lw, lh, rad)
+            vs = [[bm.verts.new((ox + x, y, oz + z)) for x, z in loop] for loop in (o_, i_) for y in (front, front + dep)]   # outer front, outer back, inner front, inner back
+            n = len(o_)
+            for a, b, flip in [(0, 2, False), (1, 3, True), (0, 1, True), (2, 3, False)]:
+                for i in range(n):
+                    j = (i + 1) % n; f = [vs[a][i], vs[a][j], vs[b][j], vs[b][i]]
+                    bm.faces.new(f[::-1] if flip else f)
+        def box(a, b, t):   # a bar from a to b, t thick
+            a, b = Vector(a), Vector(b); ax = (b - a).normalized()
+            u = ax.cross(Vector((0, 0, 1))); u = (u if u.length > 1e-5 else Vector((1, 0, 0))).normalized() * t / 2; w = ax.cross(u).normalized() * t / 2
+            c = [bm.verts.new(p + s1 * u + s2 * w) for p in (a, b) for s1, s2 in ((1, 1), (-1, 1), (-1, -1), (1, -1))]
+            for q in [(0, 1, 2, 3), (7, 6, 5, 4), (0, 4, 5, 1), (1, 5, 6, 2), (2, 6, 7, 3), (3, 7, 4, 0)]: bm.faces.new([c[i] for i in q])
+        oz = ez - d * 0.04
+        rx, lx = er.x - out_, el.x + out_
+        for sx in (rx, lx): ring(sx, oz)
+        gap0, gap1 = rx + lw / 2 + rim * 0.5, lx - lw / 2 - rim * 0.5
+        box((gap0, front + dep / 2, oz + lh * 0.22), (gap1, front + dep / 2, oz + lh * 0.22), rim * 1.1)
+        for s, ex in ((-1, rx), (1, lx)):
+            hinge = (ex + s * (lw / 2 + rim * 0.6), front + dep / 2, oz + lh * 0.3)
+            box(hinge, (cx + s * max(halfw, abs(hinge[0] - cx)) * 1.02, ear_y - d * 0.15, oz + lh * 0.22), rim * 0.8)
+        bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+        gm = bpy.data.meshes.new('eyewear'); bm.to_mesh(gm); bm.free()
+        for p in gm.polygons: p.use_smooth = False
+        go = bpy.data.objects.new('eyewear', gm); coll.objects.link(go); keep.add(go)
+        m = bpy.data.materials.new((spec.get('name') or 'Person') + '.glasses'); m.use_nodes = True
+        b = next(n for n in m.node_tree.nodes if n.type == 'BSDF_PRINCIPLED')
+        b.inputs['Base Color'].default_value = (0.012, 0.012, 0.014, 1); b.inputs['Roughness'].default_value = 0.32; b.inputs['Metallic'].default_value = 0
+        gm.materials.append(m)
+        go.vertex_groups.new(name='Head').add(range(len(gm.vertices)), 1.0, 'REPLACE')
+        go.parent = arm; go.matrix_parent_inverse = arm.matrix_world.inverted()
+        go.modifiers.new('Armature', 'ARMATURE').object = arm
+        go.select_set(True)
+
 say(90, 'Exporting')
 bpy.ops.export_scene.gltf(filepath=spec['out'], export_format='GLB', use_selection=True, export_animations=False, export_morph=True,
                           export_skins=True, export_yup=True, export_image_format='AUTO', export_morph_normal=False)
@@ -1042,12 +1852,172 @@ if spec.get('skin_tint'):   # skin tone: multiply the skin texture (glTF baseCol
     open(spec['out'], 'wb').write(b[:8] + struct.pack('<I', 20 + len(js) + len(rest)) + struct.pack('<I', len(js)) + b'JSON' + js + rest)
 say(100, 'Done')
 PY;
+const LIKENESS_MEDIAPIPE = '1.2.2';   // the version this was built and tested with
+const LIKENESS_PY = <<<'PY'
+# Photo likeness for the 3D people builder: line a front photo of a real face up with a flat front render of the built head.
+#   python likeness.py <render.png> <photo> <face_landmarker.task> <out.png> <glasses|plain> [r,g,b skin tint]
+# MediaPipe finds the same 478 face points in both pictures; a thin-plate spline bends the photo onto the render's points.
+# out.png = the bent photo (same frame as the render), alpha = where it may be painted (the face, minus the eyes or the glasses band).
+# The photo's skin color is shifted to the built skin's. Prints one JSON line: {"ok": true, ...} or {"error": ...}.
+import sys, json
+import numpy as np, cv2, mediapipe as mp
+from scipy.interpolate import RBFInterpolator
+
+render_p, photo_p, model, out_p = sys.argv[1:5]
+glasses = len(sys.argv) > 5 and sys.argv[5] == 'glasses'
+tint = np.array([float(v) for v in sys.argv[6].split(',')][::-1]) ** 2.2 if len(sys.argv) > 6 else np.ones(3)   # the builder's skin tone (b, g, r, linear)
+OVAL = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109]
+EYES = [[33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246], [263, 249, 390, 373, 374, 380, 381, 382, 362, 398, 384, 385, 386, 387, 388, 466]]
+IRIS = [468, 473]
+
+def fail(msg): print(json.dumps({'error': msg})); sys.exit(0)
+det = mp.tasks.vision.FaceLandmarker.create_from_options(mp.tasks.vision.FaceLandmarkerOptions(
+    base_options=mp.tasks.BaseOptions(model_asset_path=model), num_faces=1, min_face_detection_confidence=0.3))
+def points(img, what):
+    h, w = img.shape[:2]
+    for pad in (0, 0.5):   # a face that fills the frame is found more easily with a border around it
+        b = int(max(h, w) * pad)
+        im = cv2.copyMakeBorder(img, b, b, b, b, cv2.BORDER_CONSTANT, value=(128, 128, 128)) if b else img
+        r = det.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(im[:, :, 2::-1])))
+        if r.face_landmarks:
+            return np.array([[p.x * im.shape[1] - b, p.y * im.shape[0] - b] for p in r.face_landmarks[0]], np.float64)
+    fail('No face found in ' + what)
+
+render = cv2.imread(render_p, cv2.IMREAD_COLOR); photo = cv2.imread(photo_p, cv2.IMREAD_COLOR)
+if render is None or photo is None: fail('Could not read the pictures')
+if max(photo.shape[:2]) < 2000:   # small faces: give the detector and the sampler more pixels
+    k = 2000 / max(photo.shape[:2]); photo = cv2.resize(photo, None, fx=k, fy=k, interpolation=cv2.INTER_LANCZOS4)
+R, P = points(render, 'the built head'), points(photo, 'the photo')
+H, W = render.shape[:2]
+ipd = float(np.linalg.norm(R[IRIS[0]] - R[IRIS[1]]))
+
+# bend: for every render pixel, where to look in the photo (spline fitted on a coarse grid, then upsampled)
+tps = RBFInterpolator(R[:468], P[:468], kernel='thin_plate_spline', smoothing=ipd * 0.02)
+g = 96
+gy, gx = np.mgrid[0:g, 0:g]
+grid = np.stack([gx.ravel() * (W - 1) / (g - 1), gy.ravel() * (H - 1) / (g - 1)], 1)
+m = tps(grid).reshape(g, g, 2).astype(np.float32)
+mapx = cv2.resize(m[:, :, 0], (W, H), interpolation=cv2.INTER_CUBIC); mapy = cv2.resize(m[:, :, 1], (W, H), interpolation=cv2.INTER_CUBIC)
+warped = cv2.remap(photo, mapx, mapy, cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REPLICATE)
+
+# where to paint: the face outline (pulled in a little at the sides, where hair hangs over), minus the eyes
+c = R[OVAL].mean(0)
+oval = (R[OVAL] - c) * [0.93, 1.0] + c
+mask = np.zeros((H, W), np.uint8)
+cv2.fillPoly(mask, [oval.astype(np.int32)], 255)
+eye_y = float((R[IRIS[0]][1] + R[IRIS[1]][1]) / 2)
+if glasses:   # frames, glare and lens shadows don't belong on the skin: keep the built skin from the brows down to under the lenses
+    cv2.rectangle(mask, (0, int(eye_y - 0.42 * ipd)), (W, int(eye_y + 0.80 * ipd)), 0, -1)
+else:
+    for e in EYES:
+        ec = R[e].mean(0)
+        cv2.fillPoly(mask, [((R[e] - ec) * [1.25, 1.9] + ec).astype(np.int32)], 0)
+s = max(1.0, ipd * 0.11)
+mask = cv2.GaussianBlur(mask, (0, 0), s)
+inner = cv2.erode((mask > 0).astype(np.uint8) * 255, np.ones((3, 3), np.uint8))   # never paint past the outline
+mask = cv2.min(mask, cv2.GaussianBlur(inner, (0, 0), s * 0.5))
+
+# skin color: the photo is shifted to the built skin, not the other way round. The person's skin tone was chosen in the builder,
+# and a photo's exposure and white balance are rarely right; this keeps the face and the body one color.
+# Sampled on the forehead (cheeks can sit in the shadow of glasses), the same spots in both pictures.
+def skin(img, pts):
+    r = max(2, int(np.linalg.norm(pts[IRIS[0]] - pts[IRIS[1]]) * 0.10)); px = []
+    for i in [151, 9, 108, 337]:
+        x, y = int(pts[i][0]), int(pts[i][1])
+        px.append(img[max(0, y - r):y + r, max(0, x - r):x + r].reshape(-1, 3))
+    return (np.median(np.concatenate(px), 0) / 255) ** 2.2   # b, g, r in linear light
+gain = np.clip(skin(render, R) * tint / np.maximum(skin(photo, P), 1e-4), 0.3, 3.0)
+warped = (np.clip((warped.astype(np.float32) / 255) ** 2.2 * gain, 0, 1) ** (1 / 2.2) * 255).astype(np.uint8)
+cv2.imwrite(out_p, np.dstack([warped, mask]))
+print(json.dumps({'ok': True, 'gain': [float(g) for g in gain[::-1]], 'ipd': ipd}))
+PY;
+
+const EXTRAS_SH = <<<'SH'
+#!/bin/bash
+# Optional extras next to the engine, all local. Usage: extras.sh painter | video [/path/to/Wan2.2-TI2V-5B]
+#   painter  mflux (FLUX / Z-Image for Apple Silicon, MLX) + an 8-bit copy of Z-Image Turbo in models/z-image-turbo-q8
+#   video    a Python venv with mlx-video + Wan 2.2 TI2V-5B converted to MLX (8-bit) in models/wan22-ti2v-5b-mlx
+set -euo pipefail
+cd "$(dirname "$0")"
+WHAT="$1"; CKPT="${2:-}"
+export PATH="$HOME/.local/bin:$PATH"
+PYV=3.12
+if ! command -v uv >/dev/null; then
+  echo "==> Installing uv (the Python tool installer from astral.sh, into ~/.local/bin)"
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  export PATH="$HOME/.local/bin:$PATH"
+fi
+if [ "$WHAT" = painter ]; then
+  echo "==> Installing mflux (Python $PYV)"
+  uv tool install --upgrade --python $PYV mflux --with "pillow<13" 2>&1 | tail -2   # pillow 13 wants Python 3.15
+  echo "==> Downloading Z-Image Turbo, already quantized to 8-bit for mflux (~7 GB), into models/z-image-turbo-q8"
+  mkdir -p models && rm -rf models/z-image-turbo-q8.tmp
+  ./venv/bin/python -c "from huggingface_hub import snapshot_download; snapshot_download('mflux-community/z-image-turbo-mflux-q8', local_dir='models/z-image-turbo-q8.tmp')"
+  rm -rf models/z-image-turbo-q8 && mv models/z-image-turbo-q8.tmp models/z-image-turbo-q8
+  echo "==> PAINTER READY"
+elif [ "$WHAT" = video ]; then
+  [ -x venv-video/bin/python ] || { echo "==> Creating the video virtualenv (Python $PYV)"; uv venv venv-video --python $PYV; }
+  echo "==> Installing mlx-video (Wan 2.2 / LTX-2 on Apple Silicon) and torch (only used to convert the weights)"
+  uv pip install --python venv-video/bin/python -q mlx-video-with-audio torch safetensors "huggingface-hub>=0.28"
+  mkdir -p models
+  if [ -z "$CKPT" ]; then
+    CKPT="$PWD/models/Wan2.2-TI2V-5B"
+    if [ ! -f "$CKPT/config.json" ]; then
+      echo "==> Downloading Wan-AI/Wan2.2-TI2V-5B from Hugging Face (32 GB — this is the long part)"
+      venv-video/bin/python -c "from huggingface_hub import snapshot_download; snapshot_download('Wan-AI/Wan2.2-TI2V-5B', local_dir='$CKPT')"
+    fi
+  fi
+  echo "==> Converting to MLX with 8-bit weights from $CKPT (a few minutes)"
+  rm -rf models/wan22-ti2v-5b-mlx.tmp
+  venv-video/bin/python -m mlx_video.convert_wan --checkpoint-dir "$CKPT" --output-dir models/wan22-ti2v-5b-mlx.tmp --quantize --bits 8
+  rm -rf models/wan22-ti2v-5b-mlx && mv models/wan22-ti2v-5b-mlx.tmp models/wan22-ti2v-5b-mlx
+  if [ "$CKPT" = "$PWD/models/Wan2.2-TI2V-5B" ]; then echo "==> Removing the 32 GB original (the MLX copy is all the app needs)"; rm -rf "$CKPT"; fi
+  echo "==> VIDEO READY"
+elif [ "$WHAT" = lipsync ]; then
+  # MuseTalk 1.5 lip-sync on Apple Silicon: the musetalk-mac port (MediaPipe instead of OpenMMLab, PyTorch on MPS), pinned to one commit
+  PYV=3.11
+  if [ ! -f musetalk-mac/upstream/scripts/inference.py ]; then
+    echo "==> Fetching the MuseTalk Apple Silicon port (barnent1/musetalk-mac @ __LIPSYNC_COMMIT__)"
+    rm -rf musetalk-mac && mkdir musetalk-mac && cd musetalk-mac
+    git init -q && git remote add origin __LIPSYNC_REPO__
+    git fetch -q --depth 1 origin __LIPSYNC_COMMIT__ && git checkout -q FETCH_HEAD
+    cd ..
+  fi
+  [ -x venv-lipsync/bin/python ] || { echo "==> Creating the lip-sync virtualenv (Python $PYV)"; uv venv venv-lipsync --python $PYV; }
+  echo "==> Installing PyTorch, MediaPipe and diffusers (a few minutes)"
+  uv pip install --python venv-lipsync/bin/python -q -r musetalk-mac/requirements-mac.txt
+  echo "==> Downloading the MuseTalk 1.5 weights (~4 GB: UNet, VAE, Whisper-tiny, face parsing)"
+  M=musetalk-mac/upstream/models
+  mkdir -p $M/musetalkV15 $M/sd-vae $M/whisper $M/face-parse-bisent
+  venv-lipsync/bin/python - <<'PY'
+import os, shutil
+from huggingface_hub import hf_hub_download
+M = 'musetalk-mac/upstream/models'
+for repo, fn, dst in [('TMElyralab/MuseTalk', 'musetalkV15/unet.pth', 'musetalkV15/unet.pth'), ('TMElyralab/MuseTalk', 'musetalkV15/musetalk.json', 'musetalkV15/musetalk.json'),
+                      ('stabilityai/sd-vae-ft-mse', 'config.json', 'sd-vae/config.json'), ('stabilityai/sd-vae-ft-mse', 'diffusion_pytorch_model.bin', 'sd-vae/diffusion_pytorch_model.bin'),
+                      ('openai/whisper-tiny', 'config.json', 'whisper/config.json'), ('openai/whisper-tiny', 'pytorch_model.bin', 'whisper/pytorch_model.bin'), ('openai/whisper-tiny', 'preprocessor_config.json', 'whisper/preprocessor_config.json'),
+                      ('Kedreamix/Linly-Talker', 'MuseTalk/face-parse-bisent/79999_iter.pth', 'face-parse-bisent/79999_iter.pth')]:
+    out = os.path.join(M, dst)
+    if os.path.exists(out) and os.path.getsize(out) > 1000:
+        continue
+    print('downloading', dst, flush=True)
+    shutil.copy(hf_hub_download(repo, fn), out)
+PY
+  [ -s $M/face-parse-bisent/resnet18-5c106cde.pth ] || curl -L https://download.pytorch.org/models/resnet18-5c106cde.pth -o $M/face-parse-bisent/resnet18-5c106cde.pth
+  echo "==> LIPSYNC READY"
+else
+  echo "usage: extras.sh painter | video [checkpoint dir] | lipsync"; exit 1
+fi
+SH;
 
 const GEN_PY = <<<'PY'
 """Toon Lab extras. Each command prints one JSON line.
   gen.py image <prompt> <width> <height> <out.jpg>   scene picture, FLUX.1-schnell through your Hugging Face login
   gen.py music <dir>                                 <dir>/job.json {prompt, seconds, out} → MusicGen-small; progress in <dir>/status.json
   gen.py news <query> [n]                            this week's news stories from DuckDuckGo
+  gen.py paint <dir>                                 <dir>/job.json → a scene picture with Z-Image Turbo (mflux, on this Mac); progress in status.json
+  gen.py clip <dir>                                  <dir>/job.json → a few seconds of Wan 2.2 video (mlx-video, on this Mac); progress in status.json
+  gen.py index <dir>                                 <dir>/job.json {file, kind: footage|broll, key} → Real Avatar: pauses, key color, keyed preview, contact sheets (footage) · frames sheet + free-corner check (broll)
 Models and the Hugging Face login live in the usual ~/.cache/huggingface (not the engine's own model folder)."""
 import sys, os, json, time, subprocess
 
@@ -1133,6 +2103,289 @@ def news(q, n=8):
                   'body': x.get('body', '')} for x in r])
 
 
+def make_st(d):
+    """A status.json writer for <d> (the page polls it)."""
+    state = {}
+    def st(**kw):
+        state.update(kw)
+        with open(os.path.join(d, 'status.tmp'), 'w') as f:
+            json.dump(state, f)
+        os.replace(os.path.join(d, 'status.tmp'), os.path.join(d, 'status.json'))
+    return st
+
+
+def run_tool(cmd, st, stage, lo=0.05, hi=0.95):
+    """Run a command, mirror its output to our log, and turn its 'n/total' progress bars into status.json progress."""
+    import re
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace', bufsize=0)
+    tail, buf = [], ''
+    while True:
+        ch = p.stdout.read(1)
+        if not ch:
+            break
+        if ch in '\r\n':
+            line = buf.strip(); buf = ''
+            if not line:
+                continue
+            print(line, flush=True)
+            tail = (tail + [line])[-12:]
+            m = re.findall(r'(\d+)/(\d+)', line)
+            if m:
+                a, t = map(int, m[-1])
+                if t > 1 and a <= t:
+                    st(stage=f'{stage} {a}/{t}', progress=round(lo + (hi - lo) * a / t, 3))
+        else:
+            buf += ch
+    p.wait()
+    if p.returncode != 0:
+        raise RuntimeError(os.path.basename(str(cmd[0])) + ' failed: ' + ' | '.join(tail[-4:])[-500:])
+
+
+def paint(d):
+    """A scene picture with Z-Image Turbo through mflux (MLX, on this Mac). <d>/job.json: {prompt, width, height, seed, steps, out, bin, model}"""
+    job = json.load(open(os.path.join(d, 'job.json'))); st = make_st(d)
+    try:
+        st(state='running', stage='Loading the painter (Z-Image Turbo)', progress=0.03)
+        png = job['out'] + '.png'
+        cmd = [job['bin'], '--prompt', job['prompt'], '--width', str(job['width']), '--height', str(job['height']), '--steps', str(job.get('steps', 9)),
+               '--seed', str(job.get('seed', 1)), '--output', png, '--no-exif']
+        cmd += ['--model', job['model'], '--base-model', 'z-image-turbo'] if job.get('model') and os.path.isdir(job['model']) else ['-q', '8']
+        run_tool(cmd, st, 'Painting', 0.05, 0.92)
+        if not os.path.exists(png):
+            raise RuntimeError('The painter finished without a picture.')
+        subprocess.run(['ffmpeg', '-y', '-v', 'error', '-i', png, '-q:v', '2', job['out']], check=True)
+        os.remove(png)
+        st(state='done', stage='Done', progress=1, file=os.path.basename(job['out']))
+    except Exception as e:
+        st(state='error', stage='Failed', error=str(e)[-600:]); sys.exit(1)
+
+
+def clip(d):
+    """A few seconds of video with Wan 2.2 TI2V-5B through mlx-video. <d>/job.json: {prompt, image, width, height, frames, steps, seed, out, python, model_dir}"""
+    job = json.load(open(os.path.join(d, 'job.json'))); st = make_st(d)
+    try:
+        st(state='running', stage='Loading Wan 2.2 (first time compiles, give it a minute)', progress=0.02)
+        raw = job['out'] + '.raw.mp4'
+        cmd = [job['python'], '-m', 'mlx_video.generate_wan', '--model-dir', job['model_dir'], '--prompt', job['prompt'] or 'gentle natural motion, cinematic', '--width', str(job['width']),
+               '--height', str(job['height']), '--num-frames', str(job['frames']), '--steps', str(job.get('steps', 20)), '--seed', str(job.get('seed', 1)), '--output-path', raw]
+        if job.get('image'):
+            cmd += ['--image', job['image']]
+        run_tool(cmd, st, 'Dreaming up frames', 0.05, 0.94)
+        if not os.path.exists(raw):
+            raise RuntimeError('Wan finished without a video.')
+        st(stage='Encoding', progress=0.96)
+        subprocess.run(['ffmpeg', '-y', '-v', 'error', '-i', raw, '-an', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '18', '-movflags', '+faststart', job['out']], check=True)
+        os.remove(raw)
+        st(state='done', stage='Done', progress=1, file=os.path.basename(job['out']))
+    except Exception as e:
+        st(state='error', stage='Failed', error=str(e)[-600:]); sys.exit(1)
+
+
+# ── Real Avatar: indexing green-screen footage and background videos ──
+def probe(path):
+    out = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type,width,height,r_frame_rate:format=duration', '-of', 'json', path], capture_output=True, text=True).stdout
+    j = json.loads(out or '{}')
+    v = next((x for x in j.get('streams', []) if x.get('codec_type') == 'video'), {})
+    num, _, den = (v.get('r_frame_rate') or '25/1').partition('/')
+    return {'width': int(v.get('width', 0) or 0), 'height': int(v.get('height', 0) or 0), 'fps': round(float(num) / float(den or 1), 3),
+            'duration': round(float(j.get('format', {}).get('duration', 0) or 0), 3), 'audio': any(x.get('codec_type') == 'audio' for x in j.get('streams', []))}
+
+
+def silences(path, duration, noise='-38dB', dmin=0.35):
+    """[[start, end], …] of the quiet stretches (ffmpeg silencedetect), like a pause between sentences."""
+    import re
+    out = subprocess.run(['ffmpeg', '-nostats', '-i', path, '-af', f'silencedetect=noise={noise}:d={dmin}', '-f', 'null', '-'], capture_output=True, text=True).stderr
+    win, cur = [], None
+    for kind, val in re.findall(r'silence_(start|end): ([0-9.]+)', out):   # in order: a clip that opens on silence reports an end before any start
+        t = float(val)
+        if kind == 'start':
+            cur = t
+        else:
+            s_ = 0.0 if cur is None else cur
+            if t - s_ >= dmin:
+                win.append([round(s_, 2), round(t, 2)])
+            cur = None
+    if cur is not None and duration - cur >= dmin:
+        win.append([round(cur, 2), round(duration, 2)])
+    return win
+
+
+def complement(windows, duration, min_len=0.4):
+    out, t = [], 0.0
+    for s_, e in windows:
+        if s_ - t >= min_len:
+            out.append([round(t, 2), round(s_, 2)])
+        t = e
+    if duration - t >= min_len:
+        out.append([round(t, 2), round(duration, 2)])
+    return out
+
+
+def frame_image(path, t, crop=None, size=None):
+    """One frame as a PIL image, cropped (x, y, w, h) and scaled (w, h) by ffmpeg first."""
+    import io
+    from PIL import Image
+    vf = []
+    if crop:
+        vf.append('crop=%d:%d:%d:%d' % (crop[2], crop[3], crop[0], crop[1]))
+    if size:
+        vf.append('scale=%d:%d' % size)
+    cmd = ['ffmpeg', '-v', 'error', '-ss', f'{max(0.0, t):.3f}', '-i', path, '-frames:v', '1'] + (['-vf', ','.join(vf)] if vf else []) + ['-f', 'image2pipe', '-vcodec', 'png', '-']
+    data = subprocess.run(cmd, capture_output=True).stdout
+    return Image.open(io.BytesIO(data)).convert('RGB') if data else None
+
+
+def key_color(path, info):
+    """The screen color: the average of the green patches along the frame edges (three frames)."""
+    samples = []
+    for t in (0.3, info['duration'] / 2, max(0.3, info['duration'] - 0.3)):
+        im = frame_image(path, t, size=(160, max(16, int(160 * info['height'] / max(1, info['width'])))))
+        if not im:
+            continue
+        w, h = im.size; px = im.load()
+        for (x0, y0) in [(0, 0), (w - 6, 0), (0, h - 6), (w - 6, h - 6), (w // 2 - 3, 0), (0, h // 2 - 3), (w - 6, h // 2 - 3), (w // 2 - 3, h - 6)]:
+            r = g = b = 0
+            for x in range(x0, x0 + 6):
+                for y in range(y0, y0 + 6):
+                    c = px[x, y]; r += c[0]; g += c[1]; b += c[2]
+            samples.append((r // 36, g // 36, b // 36))
+    greens = [c for c in samples if c[1] > c[0] + 40 and c[1] > c[2] + 40] or [c for c in samples if c[2] > c[0] + 40 and c[2] > c[1] + 20]   # green screen, or a blue one
+    pool = greens or samples
+    if not pool:
+        return '#00ff00'
+    return '#%02x%02x%02x' % tuple(sum(c[i] for c in pool) // len(pool) for i in range(3))
+
+
+def key_chain(key):
+    """ffmpeg filters that cut the screen out, then suppress its spill. Two ways to find the screen:
+    chroma (ffmpeg chromakey: right for a bright, evenly lit screen) and difference (how much greener than red and blue a pixel is:
+    right for a dim or unevenly lit one, where dark green and dark hair have nearly the same chroma). mode "auto" picks by how bright the key color is."""
+    col = str(key.get('color', '#00ff00')).lstrip('#')
+    r, g, b = (int(col[i:i + 2], 16) for i in (0, 2, 4))
+    kind = 'blue' if b > g else 'green'
+    sim, blend = float(key.get('similarity', 0.12)), float(key.get('blend', 0.08))
+    spill = f"despill=type={kind}:mix={float(key.get('despill', 0.6)):.2f}:expand=0.3"
+    mode = key.get('mode') or 'auto'
+    if mode == 'auto': mode = 'difference' if max(r, g, b) < 140 else 'chroma'
+    if mode != 'difference': return [f"chromakey=0x{col}:{sim:.3f}:{blend:.3f}", spill]
+    lo = sim * 100; hi = lo + max(blend, 0.02) * 350   # screen-ness (0-127) where a pixel starts to fade, and where it is gone
+    mix = 'ar=1:ag=1:ab=-2' if kind == 'blue' else 'ar=1:ag=-2:ab=1'   # alpha = 255 - 2 * (screen channel - the mean of the other two)
+    return ['format=rgba', f"colorchannelmixer={mix}:aa=1", f"lut=a='clip((val-{255 - 2 * hi:.1f})*{255 / (2 * (hi - lo)):.4f},0,255)'", spill]
+
+
+def key_filter(key):
+    """ffmpeg: key + spill suppression, from the index's key settings."""
+    return ','.join(key_chain(key))
+
+
+def contact_sheet(path, times, out, cols, cell_w=320, crop=None, labels=None):
+    """Frames at the given times tiled into one JPEG, each with its timestamp: the diagnostics you can eyeball."""
+    from PIL import Image, ImageDraw
+    frames = [(t, frame_image(path, t, crop=crop)) for t in times]
+    frames = [(t, im) for t, im in frames if im]
+    if not frames:
+        return False
+    w0, h0 = frames[0][1].size
+    cell_h = int(cell_w * h0 / max(1, w0))
+    rows = (len(frames) + cols - 1) // cols
+    sheet = Image.new('RGB', (cols * cell_w, rows * cell_h), (16, 18, 26))
+    d = ImageDraw.Draw(sheet)
+    for i, (t, im) in enumerate(frames):
+        im = im.resize((cell_w, cell_h))
+        x, y = (i % cols) * cell_w, (i // cols) * cell_h
+        sheet.paste(im, (x, y))
+        tag = (labels[i] if labels and i < len(labels) else '') or f'{t:.2f}s'
+        d.rectangle([x, y, x + 8 + 7 * len(tag), y + 16], fill=(0, 0, 0))
+        d.text((x + 4, y + 2), tag, fill=(255, 220, 80))
+    sheet.save(out, quality=86)
+    return True
+
+
+def index(d):
+    """Index a clip for the Real Avatar page. footage: pauses, key color, keyed preview, contact sheets. broll: frames sheet + which corner is free."""
+    job = json.load(open(os.path.join(d, 'job.json'))); st = make_st(d)
+    path = job['file']; base = os.path.splitext(path)[0]; kind = job.get('kind', 'footage')
+    try:
+        st(state='running', stage='Looking at the video', progress=0.05)
+        info = probe(path)
+        if not info['width']:
+            raise RuntimeError('ffprobe could not read the video.')
+        if kind == 'broll':
+            from PIL import ImageFilter
+            times = [info['duration'] * (i + 0.5) / 8 for i in range(8)]
+            st(stage='Frames sheet', progress=0.3)
+            contact_sheet(path, times, base + '.frames.jpg', 4)
+            st(stage='Checking which corner is free', progress=0.6)
+            scores = {'tl': [], 'tr': [], 'bl': [], 'br': []}
+            for t in [info['duration'] * (i + 0.5) / 6 for i in range(6)]:
+                im = frame_image(path, t, size=(480, max(16, int(480 * info['height'] / max(1, info['width'])))))
+                if not im:
+                    continue
+                g = im.convert('L'); w, h = g.size; cw, ch = int(w * 0.36), int(h * 0.4)
+                for k, box in {'tl': (0, 0, cw, ch), 'tr': (w - cw, 0, w, ch), 'bl': (0, h - ch, cw, h), 'br': (w - cw, h - ch, w, h)}.items():
+                    reg = g.crop(box)
+                    edges = reg.filter(ImageFilter.FIND_EDGES)
+                    hist = edges.histogram()
+                    total = sum(hist) or 1
+                    scores[k].append(sum(i * c for i, c in enumerate(hist)) / total)   # mean edge strength: busy text and UI score high, flat areas low
+            corners = {k: round(sum(v) / len(v), 2) if v else 0 for k, v in scores.items()}
+            rec = min(corners, key=lambda k: corners[k]) if corners else 'bl'
+            idx = dict(info, corners=corners, recommend=rec, sheet=os.path.basename(base + '.frames.jpg'))
+            with open(base + '.index.json', 'w') as f:
+                json.dump(idx, f)
+            st(state='done', stage='Done', progress=1, index=idx)
+            return
+        idx = json.load(open(base + '.index.json')) if os.path.exists(base + '.index.json') else {}
+        idx.update(info)
+        key = dict(idx.get('key') or {})
+        key.update({k: v for k, v in (job.get('key') or {}).items() if v not in ('', None)})
+        if not key.get('color'):
+            st(stage='Finding the green', progress=0.1)
+            key['color'] = key_color(path, info)
+        key.setdefault('similarity', 0.12); key.setdefault('blend', 0.08); key.setdefault('despill', 0.6)   # ffmpeg chromakey: 0.1 keys a lit screen cleanly, 0.3 starts eating the person
+        idx['key'] = key
+        if info['audio'] and 'silences' not in idx:
+            st(stage='Listening for pauses', progress=0.18)
+            idx['silences'] = silences(path, info['duration'])
+        idx.setdefault('silences', [])
+        if not idx.get('analyzed'):   # no face analysis from the page yet: pauses stand in for idle windows
+            idx['talk'] = complement(idx['silences'], info['duration'])
+            idx['idle'] = [w for w in idx['silences'] if w[1] - w[0] >= 0.8]
+            idx['neutral'] = [round((w[0] + w[1]) / 2, 2) for w in idx['idle']][:6] or [round(min(0.5, info['duration'] / 2), 2)]
+        st(stage='Keyed preview', progress=0.3)
+        subprocess.run(['ffmpeg', '-y', '-v', 'error', '-t', '30', '-i', path, '-vf', key_filter(key) + ',scale=-2:480,format=yuva420p', '-c:v', 'libvpx-vp9', '-pix_fmt', 'yuva420p',
+                        '-b:v', '1200k', '-auto-alt-ref', '0', '-deadline', 'realtime', '-cpu-used', '8', '-an', base + '.preview.webm'], check=True)
+        st(stage='Contact sheets', progress=0.75)
+        sheets = []
+        face = idx.get('face') or {}
+        crop = None
+        if face.get('box'):
+            bx, by, bw, bh = face['box']; cx, cy = (bx + bw / 2) * info['width'], (by + bh / 2) * info['height']; side = max(bw * info['width'], bh * info['height']) * 1.9
+            crop = (int(max(0, cx - side / 2)), int(max(0, cy - side / 2)), int(min(side, info['width'])), int(min(side, info['height'])))
+        else:
+            cw, chh = int(info['width'] * 0.42), int(info['height'] * 0.5)
+            crop = ((info['width'] - cw) // 2, 0, cw, chh)
+        if idx['idle']:
+            if contact_sheet(path, [round((w[0] + w[1]) / 2, 2) for w in idx['idle'][:8]], base + '.silent-windows.jpg', 4, labels=[f'pause {w[0]:.1f}–{w[1]:.1f}s' for w in idx['idle'][:8]]):
+                sheets.append(os.path.basename(base + '.silent-windows.jpg'))
+        t0 = (idx.get('neutral') or [0.5])[0]
+        if contact_sheet(path, [max(0.0, t0 - 0.22 + 0.04 * i) for i in range(12)], base + '.p0-frames.jpg', 6, cell_w=220, crop=crop):
+            sheets.append(os.path.basename(base + '.p0-frames.jpg'))
+        talk = idx.get('talk') or []
+        if talk:
+            tt = []
+            for w in talk:
+                tt += [w[0] + (w[1] - w[0]) * f for f in (0.25, 0.75)]
+            if contact_sheet(path, tt[:8], base + '.talk-frames.jpg', 4, crop=crop):
+                sheets.append(os.path.basename(base + '.talk-frames.jpg'))
+        idx['sheets'] = sheets; idx['preview'] = os.path.basename(base + '.preview.webm')
+        with open(base + '.index.json', 'w') as f:
+            json.dump(idx, f)
+        st(state='done', stage='Done', progress=1, index=idx)
+    except Exception as e:
+        st(state='error', stage='Failed', error=str(e)[-600:]); sys.exit(1)
+
+
 if __name__ == '__main__':
     cmd = sys.argv[1]
     if cmd == 'image':
@@ -1141,6 +2394,12 @@ if __name__ == '__main__':
         music(sys.argv[2])
     elif cmd == 'news':
         news(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 8)
+    elif cmd == 'paint':
+        paint(sys.argv[2])
+    elif cmd == 'clip':
+        clip(sys.argv[2])
+    elif cmd == 'index':
+        index(sys.argv[2])
 PY;
 
 const GAME_RUNTIME_JS = <<<'JS'
@@ -1792,7 +3051,7 @@ SH;
 
 const WORKER_PY = <<<'PY'
 """Voice Swap worker: one job dir in, mixed MP3 out. Writes progress to <job>/status.json."""
-import sys, os, json, time, math, re, subprocess, fcntl, traceback, shutil, argparse
+import sys, os, json, time, math, re, subprocess, fcntl, traceback, shutil, argparse, signal
 
 ENGINE = os.path.dirname(os.path.abspath(__file__))
 SVC = os.path.join(ENGINE, 'seed-vc')
@@ -1971,8 +3230,9 @@ def run_job():
     if tts:
         st(stage='Reading your text out loud', progress=0.04)
         words = synth_speech(open(os.path.join(JOB, 'script.txt')).read(), tts, song)
-        with open(os.path.join(JOB, 'words.json'), 'w') as f:
-            json.dump(words, f)
+        if words is not None:   # Kokoro knows its word timings; other readers leave this out and the lip-sync step transcribes instead
+            with open(os.path.join(JOB, 'words.json'), 'w') as f:
+                json.dump(words, f)
     else:
         ffmpeg('-i', opts['song_path'], '-ac', '2', '-ar', '44100', song)
     if convert:
@@ -2047,8 +3307,49 @@ def run_job():
 TTS_REPO = 'hexgrad/Kokoro-82M'
 
 
+def synth_ollama(text, o, out):
+    """A speech model served by Ollama (e.g. phonon) -> 44.1kHz mono wav at `out`. Voice id: ollama/<model>/<voice>. No word timings (returns None)."""
+    import urllib.request, numpy as np, soundfile as sf
+    _, model, voice = o['voice'].split('/', 2)
+    base = (o.get('ollama') or 'http://127.0.0.1:11434').rstrip('/')
+    lines = [l.strip() for l in re.split(r'\n+', text) if l.strip()]
+    if not lines:
+        raise RuntimeError('No speakable text found.')
+    gap = np.zeros(int(24000 * 0.3), dtype=np.float32)
+    parts, off = [], 0.0
+    for i, line in enumerate(lines):
+        st(stage=f'Reading your text out loud with {voice} ({i + 1}/{len(lines)})')
+        req = urllib.request.Request(base + '/v1/audio/speech', data=json.dumps({'model': model, 'input': line, 'voice': voice, 'response_format': 'wav'}).encode(),
+                                     headers={'Content-Type': 'application/json'})
+        try:
+            with urllib.request.urlopen(req, timeout=600) as r:
+                wav = r.read()
+        except Exception as e:
+            msg = getattr(e, 'read', lambda: b'')().decode(errors='replace')[:300] if hasattr(e, 'read') else str(e)
+            raise RuntimeError(f'Ollama could not speak with {model} / {voice}: {msg or e}. Is Ollama running, and is the model pulled (ollama pull {model.split(":")[0]})?')
+        tmp = out + f'.{i}.wav'
+        with open(tmp, 'wb') as f:
+            f.write(wav)
+        raw = subprocess.run(['ffmpeg', '-v', 'error', '-i', tmp, '-f', 'f32le', '-ac', '1', '-ar', '24000', '-'], capture_output=True).stdout   # Ollama streams WAVs with open-ended headers
+        os.remove(tmp)
+        a = np.frombuffer(raw, dtype=np.float32)
+        if not len(a):
+            raise RuntimeError(f'{model} returned no audio for: {line[:60]}')
+        parts += [a, gap]
+        off += (len(a) + len(gap)) / 24000
+    tmp = out + '.24k.wav'
+    sf.write(tmp, np.concatenate(parts), 24000)
+    speed = float(o.get('speed', 1.0) or 1.0)
+    ffmpeg('-i', tmp, '-ac', '1', '-ar', '44100', *(['-af', f'atempo={max(0.5, min(2.0, speed)):.3f}'] if abs(speed - 1) > 0.02 else []), out)   # Ollama speaks at one pace; the speed slider is applied here
+    os.remove(tmp)
+    log(f'tts (ollama): {len(lines)} lines, {off:.1f}s, {model} / {voice}, speed {speed}')
+    return None
+
+
 def synth_speech(text, o, out):
     """Kokoro TTS -> 44.1kHz mono wav at `out`. Returns word timings [[start, end, word], ...] (exact text, no ASR needed)."""
+    if str(o.get('voice', '')).startswith('ollama/'):
+        return synth_ollama(text, o, out)
     try:
         from kokoro import KPipeline
     except ImportError:
@@ -2178,6 +3479,684 @@ def run_toon():
 
 
 # ── agents: one spec -> speech -> lip-sync -> headless render ──
+def run_chrome(env, url, done_file, timeout, p0, p1, label):
+    """Open a page in headless Chrome and wait for it to write done_file (the page reports back through the API). Returns the JSON it wrote."""
+    prof = os.path.join(JOB, 'chrome')
+    cmd = [env['chrome'], '--headless=new', '--autoplay-policy=no-user-gesture-required', '--no-first-run', '--no-default-browser-check', '--disable-background-timer-throttling',
+           '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows', '--remote-debugging-port=0', f'--user-data-dir={prof}', '--window-size=1500,1100', url]
+    log('chrome:', url)
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    t1 = time.time()
+    try:
+        while not os.path.exists(done_file):
+            if time.time() - t1 > timeout:
+                raise RuntimeError(f'{label}: the browser did not finish in {int(timeout)} s.')
+            if proc.poll() is not None:
+                raise RuntimeError(f'{label}: the browser quit early.')
+            st(stage=label, progress=round(p0 + (p1 - p0) * min(1.0, (time.time() - t1) / timeout), 3))
+            time.sleep(1)
+        time.sleep(0.5)
+        return json.load(open(done_file))
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except Exception:
+            pass
+        shutil.rmtree(prof, ignore_errors=True)
+
+
+def speak_line(env, text, voice_path, tts, label, p0, p1, extra=None):
+    """A child speech job (Kokoro or an Ollama voice, then Seed-VC when a saved voice is given). Returns (job id, vocals mp3 path)."""
+    jid = time.strftime('%y%m%d-%H%M%S', time.gmtime()) + '-' + os.urandom(3).hex()
+    jd = os.path.join(env['jobs'], jid)
+    os.makedirs(jd)
+    with open(os.path.join(jd, 'script.txt'), 'w') as f:
+        f.write(text)
+    v = ''
+    if voice_path:
+        v = os.path.join(jd, 'voice' + os.path.splitext(voice_path)[1])
+        shutil.copy(voice_path, v)
+    job = {'title': '📝 ' + re.sub(r'\s+', ' ', text)[:48], 'out_name': re.sub(r'[^\w\- ]+', '_', text[:32]).strip(' _') or 'line', 'voice_name': os.path.splitext(os.path.basename(voice_path))[0] if voice_path else 'AI voice',
+           'voice_path': v, 'song_path': '', 'mode': 'speech', 'separate': False, 'clean_voice': bool(v), 'auto_octave': False, 'semitones': 0, 'steps': 20, 'similarity': 0.7,
+           'vocal_vol': 100, 'music_vol': 100, 'orig_vol': 0, 'created': time.time(), 'tts': dict(tts, convert=bool(v), ollama=env.get('ollama', ''))}
+    job.update(extra or {})
+    with open(os.path.join(jd, 'job.json'), 'w') as f:
+        json.dump(job, f, indent=2)
+    s = run_child([], jd, p0, p1, label)
+    return jid, s['files']['vocals']
+
+
+def wait_music(env, mid, label='Composing the music'):
+    """Wait for a MusicGen job started by the server (a failure just means no music)."""
+    md = os.path.join(env['music'], '.jobs', mid)
+    ms = {}
+    for i in range(900):
+        ms = json.load(open(os.path.join(md, 'status.json'))) if os.path.exists(os.path.join(md, 'status.json')) else {}
+        if ms.get('state') in ('done', 'error'):
+            break
+        st(stage=label + ' ' + (ms.get('stage', '').replace('Composing', '').strip() or '…'))
+        time.sleep(1)
+    return ms.get('state') == 'done'
+
+
+def run_game():
+    """A game build for agents: speak the voice lines, wait for the music, then the Game Creator page builds the cartridge in headless Chrome."""
+    b = json.load(open(os.path.join(JOB, 'spec.json')))
+    env = b['_env']
+    t0 = time.time()
+    st(state='running', stage='Starting', progress=0.01, started=t0)
+    voice = b.get('voice') or {}
+    lines = [(k, v.strip()) for k, v in (voice.get('lines') or {}).items() if isinstance(v, str) and v.strip()]
+    files = {}
+    for i, (k, text) in enumerate(lines):
+        jid, mp3 = speak_line(env, text, env.get('voice_path') or '', {'voice': voice.get('tts_voice') or 'am_michael', 'speed': 1.0}, f'Speaking the "{k}" line', 0.02 + 0.5 * i / len(lines), 0.02 + 0.5 * (i + 1) / len(lines), {'game': os.path.basename(JOB)})
+        files[k] = {'id': jid, 'f': mp3}
+        st(voice_files=files)
+    if b.get('music_job'):
+        st(music_ok=wait_music(env, b['music_job']))
+    if not env.get('chrome'):
+        raise RuntimeError('No Chrome, Chromium, Brave or Edge found: a browser draws the sprites and builds the game file. Install Google Chrome, or open the Game Creator page and press 💾 Save.')
+    done_file = os.path.join(JOB, 'done.json')
+    r = run_chrome(env, f"http://127.0.0.1:{env['port']}/?p=game&build={os.path.basename(JOB)}", done_file, 420, 0.6, 0.98, 'Drawing the sprites and building the game file')
+    if r.get('error'):
+        raise RuntimeError(r['error'])
+    st(state='done', stage='Done', progress=1, game_id=r['id'], finished=time.time(), seconds=round(time.time() - t0))
+
+
+def api_json(port, action, body=None, form=None):
+    """Call our own server. body = JSON dict, form = {field: value} (multipart like the page), neither = GET."""
+    import urllib.request, urllib.parse
+    url = f'http://127.0.0.1:{port}/?a={action}'
+    if body is not None:
+        req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={'Content-Type': 'application/json'})
+    elif form is not None:
+        req = urllib.request.Request(url, data=urllib.parse.urlencode(form).encode(), headers={'Content-Type': 'application/x-www-form-urlencoded'})
+    else:
+        req = urllib.request.Request(url)
+    try:
+        with urllib.request.urlopen(req, timeout=1800) as r:
+            return json.loads(r.read().decode())
+    except Exception as e:
+        raw = getattr(e, 'read', lambda: b'')().decode(errors='replace') if hasattr(e, 'read') else ''
+        try:
+            j = json.loads(raw)
+            raise RuntimeError(j.get('error') or raw[:300])
+        except ValueError:
+            raise RuntimeError(f'{action}: {raw[:300] or e}')
+
+
+def ffprobe_dur(path):
+    try:
+        return float(subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', path], capture_output=True, text=True).stdout.strip())
+    except Exception:
+        return 0.0
+
+
+def has_audio(path):
+    return 'audio' in subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', path], capture_output=True, text=True).stdout
+
+
+def normalize_clip(src, out, W, H, seconds=None):
+    """Every scene becomes the same shape: WxH, 30 fps, h264 + stereo AAC 44.1k (silence added when a clip has no sound)."""
+    cmd = ['ffmpeg', '-y', '-v', 'error', '-i', src]
+    if not has_audio(src):
+        cmd += ['-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo']
+    cmd += ['-vf', f'scale={W}:{H}:force_original_aspect_ratio=decrease,pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,fps=30,format=yuv420p', '-c:v', 'libx264', '-crf', '18', '-preset', 'veryfast',
+            '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '192k', '-shortest']
+    if seconds:
+        cmd += ['-t', f'{seconds:.2f}']
+    cmd += ['-movflags', '+faststart', out]
+    subprocess.run(cmd, check=True)
+
+
+def find_font():
+    for f in ['/System/Library/Fonts/Supplemental/Impact.ttf', '/System/Library/Fonts/Supplemental/Arial Bold.ttf', '/System/Library/Fonts/Helvetica.ttc', '/Library/Fonts/Arial Bold.ttf',
+              '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf']:
+        if os.path.exists(f):
+            return f
+    return ''
+
+
+def title_card(sc, W, H, out, music=None, music_vol=0.8):
+    """A title card: a solid color, big text and a subtitle drawn with Pillow (ffmpeg's drawtext isn't in every build), a fade in and out, silence or a music sting underneath."""
+    d = float(sc.get('seconds', 3))
+    png = out + '.png'
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        im = Image.new('RGB', (W, H), sc.get('color', '#111118'))
+        g = ImageDraw.Draw(im)
+        font = find_font()
+        def fit(text, size, maxw):
+            while size > 12:
+                f = ImageFont.truetype(font, size) if font else ImageFont.load_default()
+                if g.textlength(text, font=f) <= maxw or not font:
+                    return f
+                size = int(size * 0.92)
+            return ImageFont.truetype(font, 12) if font else ImageFont.load_default()
+        title, sub = str(sc.get('text', '')).strip(), str(sc.get('sub', '')).strip()
+        f1 = fit(title, int(min(W, H) / 7), W * 0.86)
+        b = g.textbbox((0, 0), title, font=f1); tw, th = b[2] - b[0], b[3] - b[1]
+        y = (H - th) / 2 - (min(W, H) * 0.06 if sub else 0) - b[1]
+        g.text(((W - tw) / 2 + 6 - b[0], y + 6), title, font=f1, fill=(0, 0, 0))   # shadow
+        g.text(((W - tw) / 2 - b[0], y), title, font=f1, fill=sc.get('textColor', '#ffd23f'))
+        if sub:
+            f2 = fit(sub, int(min(W, H) / 20), W * 0.8)
+            b2 = g.textbbox((0, 0), sub, font=f2)
+            g.text(((W - (b2[2] - b2[0])) / 2 - b2[0], y + th + min(W, H) * 0.05), sub, font=f2, fill=(235, 235, 240))
+        im.save(png)
+    except Exception as e:   # no Pillow or no font: a plain card, never a failed episode
+        log('title card text skipped:', e)
+        subprocess.run(['ffmpeg', '-y', '-v', 'error', '-f', 'lavfi', '-i', f"color=c=0x{sc.get('color', '#111118').lstrip('#')}:s={W}x{H}:d=1:r=1", '-frames:v', '1', png], check=True)
+    audio_in = ['-stream_loop', '-1', '-i', music] if music and os.path.isfile(music) else ['-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo']
+    af = ['-af', f'volume={music_vol:.2f},afade=t=in:st=0:d=0.3,afade=t=out:st={max(0.0, d - 1.0):.2f}:d=1.0'] if music and os.path.isfile(music) else []
+    subprocess.run(['ffmpeg', '-y', '-v', 'error', '-loop', '1', '-framerate', '30', '-i', png, *audio_in, '-vf', f'fade=t=in:st=0:d=0.4,fade=t=out:st={max(0.0, d - 0.5):.2f}:d=0.5,format=yuv420p', *af,
+                    '-c:v', 'libx264', '-crf', '18', '-preset', 'veryfast', '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-t', f'{d:.2f}', '-shortest', '-movflags', '+faststart', out], check=True)
+    os.remove(png)
+
+
+def join_scenes(segs, out, transition):
+    """Join the normalized scenes: a 0.5 s crossfade chain (xfade + acrossfade), or a plain cut."""
+    if len(segs) == 1:
+        shutil.copy(segs[0], out)
+        return
+    if transition == 'fade':
+        T = 0.5
+        durs = [ffprobe_dur(s) for s in segs]
+        if all(d > T + 0.2 for d in durs):
+            cmd = ['ffmpeg', '-y', '-v', 'error']
+            for s_ in segs:
+                cmd += ['-i', s_]
+            fc, off, va, aa = [], 0.0, '[0:v]', '[0:a]'
+            for i in range(1, len(segs)):
+                off += durs[i - 1] - T
+                fc.append(f'{va}[{i}:v]xfade=transition=fade:duration={T}:offset={off:.3f}[v{i}]')
+                fc.append(f'{aa}[{i}:a]acrossfade=d={T}[a{i}]')
+                va, aa = f'[v{i}]', f'[a{i}]'
+            cmd += ['-filter_complex', ';'.join(fc), '-map', va, '-map', aa, '-c:v', 'libx264', '-crf', '18', '-preset', 'veryfast', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', out]
+            if subprocess.run(cmd, capture_output=True).returncode == 0 and os.path.exists(out):
+                return
+            log('xfade failed, joining with cuts instead')
+    lst = out + '.txt'
+    with open(lst, 'w') as f:
+        for s_ in segs:
+            f.write("file '" + s_.replace("'", r"'\''") + "'\n")
+    subprocess.run(['ffmpeg', '-y', '-v', 'error', '-f', 'concat', '-safe', '0', '-i', lst, '-c', 'copy', '-movflags', '+faststart', out], check=True)
+    os.remove(lst)
+
+
+def run_show():
+    """Showrunner: render every scene (title cards here, talks through ?a=make, B-roll through ?a=clip_gen), join them, lay the music under, publish to renders/."""
+    ep = json.load(open(os.path.join(JOB, 'spec.json')))
+    env = ep['_env']; port = env['port']
+    t0 = time.time()
+    W, H = {'16:9': (1920, 1080), '9:16': (1080, 1920), '1:1': (1080, 1080)}.get(ep.get('aspect', '16:9'), (1920, 1080))
+    scenes = ep['scenes']; n = len(scenes)
+    status = [{'kind': sc['kind'], 'state': 'queued', 'stage': '', 'progress': 0} for sc in scenes]
+    st(state='running', stage='Starting', progress=0.01, started=t0, scenes=status)
+    def upd(i, **kw):
+        status[i].update(kw)
+        st(scenes=status)
+    segs = []
+    for i, sc in enumerate(scenes):
+        lo, hi = 0.02 + 0.84 * i / n, 0.02 + 0.84 * (i + 1) / n
+        out = os.path.join(JOB, f'scene{i + 1:02d}.mp4')
+        upd(i, state='running', stage='Starting')
+        label = {'title': 'Title card', 'clip': 'B-roll', 'talk': (sc.get('name') or sc.get('preset') or 'Toon')}[sc['kind']]
+        st(stage=f'Scene {i + 1}/{n} · {label}', progress=lo)
+        if sc['kind'] == 'title':
+            mus = sc.get('music') or {}
+            if mus.get('job'):
+                wait_music(env, mus['job'], 'Composing the intro music')
+            title_card(sc, W, H, out, os.path.join(env['music'], mus['file']) if mus.get('file') else None, float(sc.get('musicVolume', 0.8) or 0.8))
+        elif sc['kind'] == 'clip':
+            if sc.get('clip') and os.path.isfile(os.path.join(env['clips'], sc['clip'])):
+                src = os.path.join(env['clips'], sc['clip'])
+            else:
+                r = api_json(port, 'clip_gen', form={'prompt': sc.get('prompt', ''), 'image': sc.get('image', ''), 'seconds': sc.get('seconds', 3), 'aspect': ep.get('aspect', '16:9')})
+                while True:
+                    cs = api_json(port, f"clip_status&id={r['id']}")
+                    upd(i, stage=cs.get('stage', ''), progress=cs.get('progress', 0))
+                    st(stage=f"Scene {i + 1}/{n} · B-roll · {cs.get('stage', '')}", progress=lo + (hi - lo) * float(cs.get('progress', 0)))
+                    if cs.get('state') == 'error':
+                        raise RuntimeError(f'Scene {i + 1} (B-roll): ' + str(cs.get('error', 'failed')))
+                    if cs.get('state') == 'done':
+                        break
+                    time.sleep(2)
+                src = os.path.join(env['clips'], r['file'])
+            normalize_clip(src, out, W, H)
+        else:
+            spec = {k: v for k, v in sc.items() if k != 'kind'}
+            spec['aspect'] = ep.get('aspect', '16:9'); spec['render'] = True
+            spec.setdefault('title', f"{ep['title']} · {i + 1}")
+            r = api_json(port, 'make', body=spec)
+            while True:
+                ms = api_json(port, f"make_status&id={r['id']}")
+                upd(i, stage=ms.get('stage', ''), progress=ms.get('progress', 0), project=r['id'])
+                st(stage=f"Scene {i + 1}/{n} · {label} · {ms.get('stage', '')}", progress=lo + (hi - lo) * float(ms.get('progress', 0)))
+                if ms.get('state') == 'error':
+                    raise RuntimeError(f'Scene {i + 1} ({label}): ' + str(ms.get('error', 'failed')))
+                if ms.get('state') == 'done':
+                    break
+                time.sleep(2)
+            if not ms.get('render_path'):
+                raise RuntimeError(f'Scene {i + 1} was not rendered (is Google Chrome installed?).')
+            src = ms['render_path']
+        normalize_clip(src, out, W, H) if sc['kind'] == 'talk' else None
+        segs.append(out)
+        upd(i, state='done', stage='Done', progress=1, render_path=src if sc['kind'] != 'title' else None)
+    st(stage='Joining the scenes', progress=0.88)
+    joined = os.path.join(JOB, 'episode.mp4')
+    join_scenes(segs, joined, ep.get('transition', 'fade'))
+    bgm = ep.get('bgm') or {}
+    if bgm.get('job'):
+        ok = wait_music(env, bgm['job'], 'Waiting for the episode music')
+        if not ok:
+            bgm = {}
+    if bgm.get('file') and os.path.isfile(os.path.join(env['music'], bgm['file'])):
+        st(stage='Laying the music under the episode', progress=0.94)
+        dur = ffprobe_dur(joined); vol = float(bgm.get('volume', 0.12) or 0.12)
+        mixed = os.path.join(JOB, 'episode-music.mp4')
+        subprocess.run(['ffmpeg', '-y', '-v', 'error', '-i', joined, '-stream_loop', '-1', '-i', os.path.join(env['music'], bgm['file']), '-filter_complex',
+                        f'[1:a]volume={vol:.3f},afade=t=in:st=0:d=1,afade=t=out:st={max(0.0, dur - 3):.2f}:d=3[m];[0:a][m]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]',
+                        '-map', '0:v', '-map', '[a]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-t', f'{dur:.2f}', '-movflags', '+faststart', mixed], check=True)
+        joined = mixed
+    name = re.sub(r'[^\w\- ().]+', '_', ep['title'])[:60].strip() or 'Episode'
+    dst = os.path.join(env['renders'], f"{name} {time.strftime('%Y-%m-%d %H%M%S')}.mp4")
+    shutil.copy(joined, dst)
+    dur = ffprobe_dur(dst)
+    with open(dst[:-4] + '.json', 'w') as f:   # the Toon Lab gallery reads this
+        json.dump({'title': ep['title'], 'style': 'episode', 'character': {'name': ep['title']}, 'duration': round(dur, 2), 'width': W, 'height': H, 'aspect': ep.get('aspect', '16:9'), 'show': os.path.basename(JOB)}, f)
+    for s_ in segs:
+        try: os.remove(s_)
+        except OSError: pass
+    st(state='done', stage='Done', progress=1, render=os.path.basename(dst), render_path=dst, duration=round(dur, 1), finished=time.time(), seconds=round(time.time() - t0))
+
+
+# ── Real Avatar: your green-screen footage → lip-synced to your cloned voice → keyed → over your screen recording, with burned-in subtitles ──
+def run_cmd(cmd, label, p0, p1, cwd=None, extra_env=None, timeout=7200):
+    """Run a long command, mirror its output to our log, and turn 'n/total' progress bars into status progress."""
+    env = dict(os.environ); env.update(extra_env or {})
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=cwd, env=env, text=True, errors='replace', bufsize=0)
+    tail, buf, t1 = [], '', time.time()
+    while True:
+        ch = proc.stdout.read(1)
+        if not ch:
+            break
+        if ch in '\r\n':
+            line = buf.strip(); buf = ''
+            if line:
+                tail = (tail + [line])[-14:]
+                if not re.search(r'\d+%\|', line) or len(tail) % 10 == 0:
+                    print(line[:300], flush=True)
+                m = re.findall(r'(\d+)/(\d+)', line)
+                if m:
+                    a, t = map(int, m[-1])
+                    if 1 < t and a <= t:
+                        st(stage=f'{label} {a}/{t}', progress=round(p0 + (p1 - p0) * a / t, 3))
+        else:
+            buf += ch
+        if time.time() - t1 > timeout:
+            proc.kill(); raise RuntimeError(f'{label}: gave up after {timeout // 60} minutes.')
+    proc.wait()
+    if proc.returncode != 0:
+        raise RuntimeError(f'{label} failed: ' + ' | '.join(tail[-4:])[-600:])
+
+
+def join_video(segs, out, T=0.25):
+    """Join video-only segments with short crossfades (a cut where a segment is too short for one)."""
+    if len(segs) == 1:
+        shutil.copy(segs[0], out); return
+    durs = [ffprobe_dur(x) for x in segs]
+    if all(d_ > T + 0.1 for d_ in durs):
+        cmd = ['ffmpeg', '-y', '-v', 'error']
+        for x in segs:
+            cmd += ['-i', x]
+        fc, off, v = [], 0.0, '[0:v]'
+        for i in range(1, len(segs)):
+            off += durs[i - 1] - T
+            fc.append(f'{v}[{i}:v]xfade=transition=fade:duration={T}:offset={off:.3f}[v{i}]'); v = f'[v{i}]'
+        cmd += ['-filter_complex', ';'.join(fc), '-map', v, '-an', '-c:v', 'libx264', '-crf', '17', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', out]
+        if subprocess.run(cmd, capture_output=True).returncode == 0 and os.path.exists(out):
+            return
+    lst = out + '.txt'
+    with open(lst, 'w') as f:
+        for x in segs:
+            f.write("file '" + x.replace("'", r"'\''") + "'\n")
+    subprocess.run(['ffmpeg', '-y', '-v', 'error', '-f', 'concat', '-safe', '0', '-i', lst, '-c', 'copy', out], check=True)
+    os.remove(lst)
+
+
+def load_font(path, size):
+    """A bold face from a .ttf/.ttc (Pillow needs an index for collections)."""
+    from PIL import ImageFont
+    if not path or not os.path.exists(path):
+        return ImageFont.load_default()
+    best = None
+    for i in range(12):
+        try:
+            f = ImageFont.truetype(path, int(size), index=i)
+        except Exception:
+            break
+        style = (f.getname()[1] or '')
+        if best is None:
+            best = f
+        if 'Italic' not in style and any(k in style for k in ('Bold', 'Black', 'Heavy')):
+            return f
+    return best or ImageFont.load_default()
+
+
+def phrase_groups(words, max_chars):
+    """Words → phrases that fit on a line or two: split on punctuation, long gaps, or length."""
+    out, cur = [], []
+    for w in words:
+        if cur and (sum(len(x[2]) + 1 for x in cur) + len(w[2]) > max_chars or w[0] - cur[-1][1] > 0.7 or re.search(r'[.!?]$', cur[-1][2])):
+            out.append(cur); cur = []
+        cur.append(w)
+    if cur:
+        out.append(cur)
+    return out
+
+
+class Overlay:
+    """Subtitles (karaoke / subtitle / pop) and captions (title, lower-third), drawn with Pillow into RGBA frames that ffmpeg lays over the video."""
+    def __init__(self, W, H, spec, words, fonts, avatar_box):
+        from PIL import Image
+        self.W, self.H, self.spec, self.fonts, self.Image = W, H, spec, fonts, Image
+        sub = spec['subtitles']; self.sub = sub
+        base = min(W, H) * 0.058 * float(sub.get('size', 1))
+        self.font = load_font(fonts.get(sub.get('font', ''), ''), base)
+        self.big = load_font(fonts.get(sub.get('font', ''), ''), base * 1.35)
+        ax, ay, aw, ah = avatar_box
+        pos = sub.get('pos', 'auto')
+        if pos == 'auto':
+            pos = 'above' if ay > H * 0.45 else ('below' if ay + ah < H * 0.55 else 'middle')
+        self.y_center = {'top': H * 0.14, 'middle': H * 0.5, 'bottom': H * 0.84, 'above': max(H * 0.2, ay - min(W, H) * 0.09), 'below': min(H * 0.86, ay + ah + min(W, H) * 0.09)}[pos]
+        self.lower_right = ax < W / 2   # the name banner goes to the side the avatar is not on
+        self.states = []   # (start, end, kind, payload)
+        style = sub.get('style', 'karaoke')
+        if words and style != 'off':
+            maxc = 26 if W < H else 42
+            groups = phrase_groups(words, maxc)
+            for g in groups:
+                g_start, g_end = g[0][0], g[-1][1] + 0.25
+                if style == 'subtitle':
+                    self.states.append((g_start, g_end, 'sub', (g, -1)))
+                elif style == 'pop':
+                    for i, w in enumerate(g):
+                        nxt = g[i + 1][0] if i + 1 < len(g) else g_end
+                        self.states.append((w[0], max(w[0] + 0.12, nxt), 'pop', w[2]))
+                else:
+                    for i, w in enumerate(g):
+                        nxt = g[i + 1][0] if i + 1 < len(g) else g_end
+                        self.states.append((w[0], nxt, 'sub', (g, i)))
+        self.caps = spec.get('captions') or []
+        self.cache_key, self.cache = None, None
+
+    def active(self, t):
+        sub = next((s_ for s_ in self.states if s_[0] <= t < s_[1]), None)
+        caps = tuple(i for i, c in enumerate(self.caps) if c['start'] <= t < c['end'])
+        return (sub[2], sub[3] if sub[2] != 'sub' else (id(sub[3][0]), sub[3][1])) if sub else None, caps, sub
+
+    def frame(self, t):
+        """RGBA bytes for time t, re-rendered only when the text changes."""
+        key_, caps, sub = self.active(t)
+        ck = (key_, caps)
+        if ck == self.cache_key:
+            return self.cache
+        from PIL import ImageDraw
+        im = self.Image.new('RGBA', (self.W, self.H), (0, 0, 0, 0))
+        d = ImageDraw.Draw(im)
+        for i in caps:
+            self.draw_caption(d, self.caps[i])
+        if sub:
+            if sub[2] == 'pop':
+                self.draw_lines(d, [[(sub[3], True)]], self.big, self.y_center, pop=True)
+            else:
+                g, hi = sub[3]
+                self.draw_lines(d, self.wrap([(w[2], j == hi) for j, w in enumerate(g)]), self.font, self.y_center)
+        self.cache_key, self.cache = ck, im.tobytes()
+        return self.cache
+
+    def wrap(self, tokens):
+        maxw = self.W * 0.84; lines, cur, curw = [], [], 0
+        space = self.font.getlength(' ')
+        for text, hi in tokens:
+            w = self.font.getlength(text)
+            if cur and curw + space + w > maxw:
+                lines.append(cur); cur, curw = [], 0
+            cur.append((text, hi)); curw += (space if curw else 0) + w
+        if cur:
+            lines.append(cur)
+        return lines[:3]
+
+    def draw_lines(self, d, lines, font, y_center, pop=False):
+        sub = self.sub
+        lh = int(font.size * 1.25)
+        total = lh * len(lines)
+        y = int(y_center - total / 2)
+        col = tuple(int(sub.get('color', '#ffffff').lstrip('#')[i:i + 2], 16) for i in (0, 2, 4))
+        hic = tuple(int(sub.get('hi', '#ffd23f').lstrip('#')[i:i + 2], 16) for i in (0, 2, 4))
+        space = font.getlength(' ')
+        for line in lines:
+            w = sum(font.getlength(tk) for tk, _ in line) + space * (len(line) - 1)
+            x = int((self.W - w) / 2)
+            if sub.get('box', True):
+                pad = int(font.size * 0.3)
+                d.rounded_rectangle([x - pad, y - pad // 2, x + w + pad, y + lh], radius=int(font.size * 0.25), fill=(0, 0, 0, 150))
+            for tk, hi in line:
+                fill = hic if (hi and not pop) else (hic if pop else col)
+                for dx, dy in ((2, 2), (-2, 2), (2, -2), (-2, -2), (0, 3)):
+                    d.text((x + dx, y + dy), tk, font=font, fill=(0, 0, 0, 230))
+                d.text((x, y), tk, font=font, fill=fill + (255,))
+                x += font.getlength(tk) + space
+            y += lh
+
+    def draw_caption(self, d, c):
+        f = load_font(self.fonts.get(c.get('font', ''), self.fonts.get(self.sub.get('font', ''), '')), min(self.W, self.H) * (0.075 if c['kind'] == 'title' else 0.042))
+        col = tuple(int(c['color'].lstrip('#')[i:i + 2], 16) for i in (0, 2, 4))
+        txt = c['text']
+        w = f.getlength(txt); lh = int(f.size * 1.2)
+        if c['kind'] == 'title':
+            x, y = int((self.W - w) / 2), int(self.H * 0.07)
+            for dx, dy in ((3, 3), (-3, 3), (3, -3), (-3, -3), (0, 4)):
+                d.text((x + dx, y + dy), txt, font=f, fill=(0, 0, 0, 230))
+            d.text((x, y), txt, font=f, fill=col + (255,))
+        else:
+            pad = int(f.size * 0.45)
+            x = int(self.W - w - pad * 2 - self.W * 0.04) if self.lower_right else int(self.W * 0.04)
+            y = int(self.H * 0.90 - lh)
+            d.rectangle([x, y, x + w + pad * 2, y + lh + pad // 2], fill=col + (235,))
+            d.text((x + pad, y + pad // 4), txt, font=f, fill=(255, 255, 255, 255))
+
+
+def key_chain(key):
+    """ffmpeg filters that cut the screen out, then suppress its spill. Two ways to find the screen:
+    chroma (ffmpeg chromakey: right for a bright, evenly lit screen) and difference (how much greener than red and blue a pixel is:
+    right for a dim or unevenly lit one, where dark green and dark hair have nearly the same chroma). mode "auto" picks by how bright the key color is."""
+    col = str(key.get('color', '#00ff00')).lstrip('#')
+    r, g, b = (int(col[i:i + 2], 16) for i in (0, 2, 4))
+    kind = 'blue' if b > g else 'green'
+    sim, blend = float(key.get('similarity', 0.12)), float(key.get('blend', 0.08))
+    spill = f"despill=type={kind}:mix={float(key.get('despill', 0.6)):.2f}:expand=0.3"
+    mode = key.get('mode') or 'auto'
+    if mode == 'auto': mode = 'difference' if max(r, g, b) < 140 else 'chroma'
+    if mode != 'difference': return [f"chromakey=0x{col}:{sim:.3f}:{blend:.3f}", spill]
+    lo = sim * 100; hi = lo + max(blend, 0.02) * 350   # screen-ness (0-127) where a pixel starts to fade, and where it is gone
+    mix = 'ar=1:ag=1:ab=-2' if kind == 'blue' else 'ar=1:ag=-2:ab=1'   # alpha = 255 - 2 * (screen channel - the mean of the other two)
+    return ['format=rgba', f"colorchannelmixer={mix}:aa=1", f"lut=a='clip((val-{255 - 2 * hi:.1f})*{255 / (2 * (hi - lo)):.4f},0,255)'", spill]
+
+
+def run_real():
+    spec = json.load(open(os.path.join(JOB, 'spec.json')))
+    env = spec['_env']
+    t0 = time.time()
+    st(state='running', stage='Starting', progress=0.01, started=t0)
+    W, H = {'16:9': (1920, 1080), '9:16': (1080, 1920), '1:1': (1080, 1080)}.get(spec.get('aspect', '9:16'), (1080, 1920))
+    foot = os.path.join(env['footage'], spec['footage'])
+    idx_path = os.path.splitext(foot)[0] + '.index.json'
+    idx = json.load(open(idx_path)) if os.path.exists(idx_path) else {}
+    fdur = float(idx.get('duration') or ffprobe_dur(foot))
+    # ── B: the voice (your cloned voice through the speech pipeline), and the words for the subtitles ──
+    words = []
+    if spec.get('script'):
+        jid, mp3 = speak_line(env, spec['script'], env.get('voice_path') or '', {'voice': spec['tts_voice'], 'speed': spec['speed']}, 'Speaking your script' + (' in your voice' if env.get('voice_path') else ''), 0.02, 0.28, {'real': os.path.basename(JOB), 'steps': spec.get('steps', 25)})
+        voice = os.path.join(env['jobs'], jid, mp3)
+        wp = os.path.join(env['jobs'], jid, 'words.json')
+        if os.path.exists(wp):
+            words = json.load(open(wp))
+        st(job=jid, audio_path=voice)
+    else:
+        voice = spec['audio']
+    if not words:   # audio you brought, or an Ollama voice: Whisper finds the words
+        td = os.path.join(env['toons'], time.strftime('%y%m%d-%H%M%S', time.gmtime()) + '-' + os.urandom(3).hex())
+        os.makedirs(td)
+        with open(os.path.join(td, 'job.json'), 'w') as f:
+            json.dump({'audio_path': voice, 'isolate': False, 'words': True, 'words_path': None, 'created': time.time()}, f)
+        words = run_child(['--toon'], td, 0.28, 0.33, 'Finding the words')['words'] if False else json.load(open(os.path.join(td, 'result.json'))).get('words', []) if (run_child(['--toon'], td, 0.28, 0.33, 'Finding the words') or True) else []
+    voice16 = os.path.join(JOB, 'voice16.wav')
+    ffmpeg('-i', voice, '-ac', '1', '-ar', '16000', voice16)
+    D = ffprobe_dur(voice16)
+    pauses = [[round(words[i][1], 2), round(words[i + 1][0], 2)] for i in range(len(words) - 1) if words[i + 1][0] - words[i][1] >= 0.5]
+    st(duration=round(D, 2), words=len(words), pauses=pauses)
+    # ── D1: a source track from your footage: the talking stretches, chained with crossfades until it covers the voice ──
+    st(stage='Preparing your footage', progress=0.34)
+    res = int(spec['avatar'].get('res', 720))
+    windows = [w for w in (idx.get('talk') or []) if w[1] - w[0] >= 0.6] or [[0.0, fdur]]
+    segs, total, i = [], 0.0, 0
+    while total < D + 0.4 and i < 60:
+        w = windows[i % len(windows)]
+        seg = os.path.join(JOB, f'seg{i:02d}.mp4')
+        ffmpeg('-ss', f'{w[0]:.3f}', '-t', f'{w[1] - w[0]:.3f}', '-i', foot, '-vf', f"scale='min({res},ih)*iw/ih':'min({res},ih)',scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=25", '-an', '-c:v', 'libx264', '-crf', '17', '-preset', 'veryfast', seg)
+        segs.append(seg); total += w[1] - w[0] - 0.25; i += 1
+    source = os.path.join(JOB, 'source.mp4')
+    join_video(segs, source)
+    for x in segs:
+        os.remove(x)
+    # ── D2: lip-sync (MuseTalk) ──
+    synced = os.path.join(JOB, 'synced.mp4')
+    engine = env.get('lipsync') if spec.get('lipsync', 'auto') != 'off' else None
+    if engine:
+        st(stage='Lip-sync: loading MuseTalk (the first run takes a minute)', progress=0.38)
+        ms = os.path.join(JOB, 'ms'); os.makedirs(ms, exist_ok=True)
+        cfg = os.path.join(ms, 'task.yaml')
+        with open(cfg, 'w') as f:
+            f.write(f'task_0:\n  video_path: "{source}"\n  audio_path: "{voice16}"\n')
+        up = os.path.join(engine['dir'], 'upstream')
+        run_cmd([engine['python'], '-m', 'scripts.inference', '--inference_config', cfg, '--result_dir', ms, '--unet_model_path', './models/musetalkV15/unet.pth', '--unet_config', './models/musetalkV15/musetalk.json',
+                 '--whisper_dir', './models/whisper', '--version', 'v15', '--batch_size', '8', '--output_vid_name', 'synced.mp4'], 'Lip-syncing your mouth to the words', 0.4, 0.8, cwd=up,
+                extra_env={'PYTORCH_ENABLE_MPS_FALLBACK': '1', 'GLOG_minloglevel': '2', 'TOKENIZERS_PARALLELISM': 'false'})
+        out = os.path.join(ms, 'v15', 'synced.mp4')
+        if not os.path.exists(out):
+            found = [os.path.join(r, f) for r, _, fs in os.walk(ms) for f in fs if f.endswith('.mp4') and 'synced' in f]
+            if not found:
+                raise RuntimeError('MuseTalk finished without a video (see the log).')
+            out = found[0]
+        shutil.move(out, synced); shutil.rmtree(ms, ignore_errors=True)
+        st(lipsync='musetalk')
+    else:
+        ffmpeg('-i', source, '-i', voice16, '-map', '0:v', '-map', '1:a', '-c:v', 'copy', '-c:a', 'aac', '-shortest', synced)
+        st(lipsync='passthrough', warning='Lip-sync is not installed, so this is your footage as-is (the mouth does not follow the words). Showrunner → Engines → Install lip-sync.')
+    os.remove(source)
+    # ── E: key the green, place the avatar over the background, lay the subtitles on top, mix the sound ──
+    st(stage='Keying and compositing', progress=0.82)
+    av = spec['avatar']; key = spec['key']
+    col = key['color'].lstrip('#'); kind = 'blue' if int(col[4:6], 16) > int(col[2:4], 16) else 'green'
+    aw_src, ah_src = (idx.get('width') or 1280), (idx.get('height') or 720)
+    face = (idx.get('face') or {}).get('box')
+    cx = (face[0] + face[2] / 2) if face else 0.5
+    crop_w = float(av.get('crop', 0.8)); crop_w = min(1.0, max(0.3, crop_w))
+    avh = int(H * float(av['size'])) // 2 * 2
+    margin = int(H * float(av['margin']))
+    # the avatar layer: crop to the person (portrait), key, despill, mirror, scale, optional circle
+    chain = [f"crop=w='min(iw,ih*{crop_w * ah_src / aw_src * aw_src / ah_src:.4f})':h=ih:x='min(max(0,iw*{cx:.3f}-ow/2),iw-ow)':y=0",
+             *key_chain(key)]
+    if av.get('mirror'):
+        chain.append('hflip')
+    if av.get('shape') == 'circle':
+        chain += ['crop=w=min(iw\\,ih):h=min(iw\\,ih):x=(iw-ow)/2:y=0', f'scale={avh}:{avh}', 'format=rgba', "geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lte(hypot(X-W/2,Y-H/2),min(W,H)/2-2),alpha(X,Y),0)'"]
+    else:
+        chain += [f'scale=-2:{avh}', 'format=rgba']
+    # where it goes
+    aw_est = avh * crop_w * ah_src / aw_src * (aw_src / ah_src) if av.get('shape') != 'circle' else avh
+    pos = {'bl': (f'{margin}', f'H-h-{margin}'), 'br': (f'W-w-{margin}', f'H-h-{margin}'), 'tl': (f'{margin}', f'{margin}'), 'tr': (f'W-w-{margin}', f'{margin}'), 'bc': ('(W-w)/2', f'H-h-{margin}'), 'c': ('(W-w)/2', '(H-h)/2')}[av['corner']]
+    ax_px = {'bl': margin, 'tl': margin, 'br': W - int(aw_est) - margin, 'tr': W - int(aw_est) - margin, 'bc': int((W - aw_est) / 2), 'c': int((W - aw_est) / 2)}[av['corner']]
+    ay_px = {'bl': H - avh - margin, 'br': H - avh - margin, 'bc': H - avh - margin, 'tl': margin, 'tr': margin, 'c': int((H - avh) / 2)}[av['corner']]
+    # the background
+    inputs = []
+    bk = spec.get('broll_kind')
+    if bk in ('video', 'clip'):
+        bpath = os.path.join(env['broll'] if bk == 'video' else env['clips'], spec['broll'])
+        inputs += ['-stream_loop', '-1', '-i', bpath]; b_audio = has_audio(bpath) and float(spec.get('broll_audio', 0)) > 0
+    elif bk == 'image':
+        inputs += ['-loop', '1', '-framerate', '30', '-i', os.path.join(env['scenes'], spec['broll'])]; b_audio = False
+    else:
+        inputs += ['-f', 'lavfi', '-i', f"color=c=0x{spec.get('bgColor', '#101418').lstrip('#')}:s={W}x{H}:r=30"]; b_audio = False
+    inputs += ['-stream_loop', '-1', '-i', synced, '-i', voice]
+    fit = spec.get('fit', 'blur')
+    if fit == 'cover':
+        bg = f'[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps=30,format=yuv420p[bg]'
+    elif fit == 'contain':
+        bg = f'[0:v]scale={W}:{H}:force_original_aspect_ratio=decrease,pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,fps=30,format=yuv420p[bg]'
+    else:
+        bg = (f'[0:v]fps=30,split[b1][b2];[b1]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},boxblur=28:3,eq=brightness=-0.1[bb];'
+              f'[b2]scale={W}:{H}:force_original_aspect_ratio=decrease[bf];[bb][bf]overlay=(W-w)/2:(H-h)/2,format=yuv420p[bg]')
+    fc = [bg, '[1:v]' + ','.join(chain) + '[av]', f'[bg][av]overlay={pos[0]}:{pos[1]}:format=auto[v1]']
+    ov = Overlay(W, H, spec, words, env.get('fonts') or {}, (ax_px, ay_px, int(aw_est), avh))
+    use_overlay = bool(ov.states or ov.caps)
+    ai = 3
+    if use_overlay:
+        inputs += ['-f', 'rawvideo', '-pix_fmt', 'rgba', '-video_size', f'{W}x{H}', '-framerate', '30', '-i', 'pipe:0']
+        fc.append('[v1][3:v]overlay=0:0:format=auto[vout]'); ai = 4
+    else:
+        fc.append('[v1]null[vout]')
+    amix = ['[2:a]volume=1.0[va]']; mixin = '[va]'; nmix = 1
+    if b_audio:
+        amix.append(f"[0:a]volume={float(spec.get('broll_audio', 0.12)):.2f}[ba]"); mixin += '[ba]'; nmix += 1
+    bgm = spec.get('bgm') or {}
+    if bgm.get('file') and os.path.isfile(os.path.join(env['music'], bgm['file'])):
+        if bgm.get('job'):
+            wait_music(env, bgm['job'])
+        inputs += ['-stream_loop', '-1', '-i', os.path.join(env['music'], bgm['file'])]
+        amix.append(f"[{ai}:a]volume={float(bgm.get('volume', 0.15) or 0.15):.2f},afade=t=out:st={max(0.0, D - 2.5):.2f}:d=2.5[bm]"); mixin += '[bm]'; nmix += 1
+    fc += amix + ([f'{mixin}amix=inputs={nmix}:duration=first:dropout_transition=0:normalize=0[aout]'] if nmix > 1 else ['[va]anull[aout]'])
+    final = os.path.join(JOB, 'final.mp4')
+    cmd = ['ffmpeg', '-y', '-v', 'error', '-nostdin' if not use_overlay else '-y'] + inputs + ['-filter_complex', ';'.join(fc), '-map', '[vout]', '-map', '[aout]', '-t', f'{D + 0.35:.2f}', '-r', '30',
+           '-c:v', 'libx264', '-crf', '18', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', final]
+    log('compose:', ' '.join(c if ' ' not in c else repr(c) for c in cmd)[:1500])
+    if use_overlay:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        nframes = int((D + 0.35) * 30) + 2
+        try:
+            for fi in range(nframes):
+                proc.stdin.write(ov.frame(fi / 30))
+                if fi % 150 == 0:
+                    st(stage=f'Keying and compositing · {int(100 * fi / nframes)}%', progress=round(0.82 + 0.12 * fi / nframes, 3))
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
+        err = proc.stderr.read().decode(errors='replace'); proc.wait()
+        if proc.returncode != 0 or not os.path.exists(final):
+            raise RuntimeError('Compositing failed: ' + err[-600:])
+    else:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0 or not os.path.exists(final):
+            raise RuntimeError('Compositing failed: ' + r.stderr[-600:])
+    # ── publish + diagnostics ──
+    st(stage='Publishing', progress=0.96)
+    name = re.sub(r'[^\w\- ().]+', '_', spec['title'])[:60].strip() or 'Real Avatar'
+    dst = os.path.join(env['renders'], f"{name} {time.strftime('%Y-%m-%d %H%M%S')}.mp4")
+    shutil.move(final, dst)
+    dur = ffprobe_dur(dst)
+    with open(dst[:-4] + '.json', 'w') as f:
+        json.dump({'title': spec['title'], 'style': 'avatar', 'character': {'name': spec['title']}, 'duration': round(dur, 2), 'width': W, 'height': H, 'aspect': spec.get('aspect', '9:16'), 'real': os.path.basename(JOB)}, f)
+    for src_, out_ in ((synced, 'avatar-frames.jpg'), (dst, 'composite-frames.jpg')):
+        subprocess.run(['ffmpeg', '-y', '-v', 'error', '-i', src_, '-vf', f"select='not(mod(n\\,{max(1, int(dur * 30 / 6))}))',scale=-1:360,tile=6x1", '-frames:v', '1', os.path.join(JOB, out_)], capture_output=True)
+    if spec.get('export_avatar'):
+        st(stage='Exporting the keyed avatar (VP9 with transparency)', progress=0.98)
+        subprocess.run(['ffmpeg', '-y', '-v', 'error', '-i', synced, '-vf', ','.join(chain[:3]) + ',format=yuva420p', '-c:v', 'libvpx-vp9', '-pix_fmt', 'yuva420p', '-b:v', '4M', '-auto-alt-ref', '0', '-an', os.path.join(JOB, 'avatar.webm')], capture_output=True)
+    st(state='done', stage='Done', progress=1, render=os.path.basename(dst), render_path=dst, duration=round(dur, 1), finished=time.time(), seconds=round(time.time() - t0))
+
+
 def read_status(d):
     try:
         return json.load(open(os.path.join(d, 'status.json')))
@@ -2222,7 +4201,7 @@ def run_make():
         job = {'title': '📝 ' + title, 'out_name': re.sub(r'[^\w\- ().]+', '_', title)[:60] or 'speech', 'voice_name': spec['voice'] or 'AI voice',
                'voice_path': voice, 'song_path': '', 'mode': 'speech', 'separate': False, 'clean_voice': bool(voice), 'auto_octave': False,
                'semitones': 0, 'steps': spec['steps'], 'similarity': 0.7, 'vocal_vol': 100, 'music_vol': 100, 'orig_vol': 0, 'created': time.time(),
-               'tts': {'voice': spec['tts_voice'], 'speed': spec['speed'], 'convert': bool(voice)}, 'project': os.path.basename(JOB)}
+               'tts': {'voice': spec['tts_voice'], 'speed': spec['speed'], 'convert': bool(voice), 'ollama': env.get('ollama', '')}, 'project': os.path.basename(JOB)}
         with open(os.path.join(jd, 'job.json'), 'w') as f:
             json.dump(job, f, indent=2)
         st(job=jid)
@@ -2300,12 +4279,12 @@ if __name__ == '__main__':
     if sys.argv[1] == '--prefetch':
         prefetch()
         sys.exit(0)
-    mode = sys.argv[1] if sys.argv[1] in ('--toon', '--make') else ''
+    mode = sys.argv[1] if sys.argv[1] in ('--toon', '--make', '--game', '--show', '--real') else ''
     JOB = os.path.abspath(sys.argv[-1])
     os.setpgrp()                                      # so "cancel" can kill demucs children too
     STATUS.update(json.load(open(os.path.join(JOB, 'status.json'))) if os.path.exists(os.path.join(JOB, 'status.json')) else {})
     try:
-        {'--toon': run_toon, '--make': run_make}.get(mode, run_job)()
+        {'--toon': run_toon, '--make': run_make, '--game': run_game, '--show': run_show, '--real': run_real}.get(mode, run_job)()
     except Exception as e:
         traceback.print_exc()
         st(state='error', stage='Failed', error=str(e)[-600:])
@@ -2315,7 +4294,7 @@ PY;
 // ───────────────────────────── CLI (after every const above is defined) ─────────────────────────────
 if (PHP_SAPI === 'cli') {
     $cmd = $argv[1] ?? '';
-    if (in_array($cmd, ['options', 'make', 'status', 'skill', 'person'], true)) { cli_agent($cmd, array_slice($argv, 2)); exit; }
+    if (in_array($cmd, ['options', 'make', 'status', 'skill', 'person', 'game', 'show', 'real', 'paint', 'clip', 'speak', 'extras'], true)) { cli_agent($cmd, array_slice($argv, 2)); exit; }
     if ($cmd === 'person-build') { person_build($argv[2] ?? ''); exit; }   // background job started by ?a=person_make
     if ($cmd === 'setup') {
         $py = find_python();
@@ -2355,6 +4334,7 @@ if ($a !== '') {
                 'log' => implode("\n", array_slice(explode("\n", preg_replace('/[^\n]*\r/', '', $log)), -18)),
                 'upload_limit' => ini_get('upload_max_filesize'),
                 'ram_gb' => round(((int)shell_exec('sysctl -n hw.memsize 2>/dev/null')) / 1073741824),
+                'chrome' => find_chrome(), 'blender' => find_blender(),   // the renderer and the 3D person builder (Showrunner → Engines)
             ]);
 
         case 'install':
@@ -2363,7 +4343,7 @@ if ($a !== '') {
             if (!find_bin('ffmpeg')) json_out(['error' => 'ffmpeg not found. Run: brew install ffmpeg'], 400);
             if (pid_alive((int)@file_get_contents(ENGINE . '/install.pid'))) json_out(['ok' => true]);
             write_engine_files();
-            $cmd = '(cd ' . escapeshellarg(ENGINE) . ' && exec nohup env PATH=' . escapeshellarg(SYS_PATH) . ' bash install.sh '
+            $cmd = '(cd ' . escapeshellarg(ENGINE) . ' && for fd in 3 4 5 6 7 8 9; do eval "exec $fd>&-"; done && exec nohup env PATH=' . escapeshellarg(SYS_PATH) . ' bash install.sh '
                 . escapeshellarg($py) . ') < /dev/null > ' . escapeshellarg(ENGINE . '/install.log') . ' 2>&1 & echo $!';
             file_put_contents(ENGINE . '/install.pid', trim((string)shell_exec($cmd)));
             json_out(['ok' => true]);
@@ -2427,7 +4407,7 @@ if ($a !== '') {
                     'steps' => max(5, min(80, (int)($_POST['steps'] ?? 30))),
                     'similarity' => max(0, min(1, (float)($_POST['similarity'] ?? 0.7))),
                     'vocal_vol' => 100, 'music_vol' => 100, 'orig_vol' => 0, 'created' => time(),
-                    'tts' => ['voice' => tts_voice((string)($_POST['tts_voice'] ?? '')), 'speed' => clampf($_POST['tts_speed'] ?? 1, 0.6, 1.6, 1), 'convert' => !$aiOnly],
+                    'tts' => ['voice' => tts_voice((string)($_POST['tts_voice'] ?? '')), 'speed' => clampf($_POST['tts_speed'] ?? 1, 0.6, 1.6, 1), 'convert' => !$aiOnly, 'ollama' => ollama_url()],
                 ];
                 file_put_contents("$dir/job.json", json_encode($job, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
                 spawn_worker($dir);
@@ -2633,6 +4613,7 @@ if ($a !== '') {
             $in = json_decode((string)file_get_contents('php://input'), true);
             if (!is_array($in)) json_out(['error' => 'Send the person as a JSON body.'], 400);
             if (!find_blender()) json_out(['error' => 'Blender not found. Install it from blender.org (free) into /Applications.'], 400);
+            if ($bad = person_check($in)) json_out(['error' => $bad], 400);
             $id = new_id(); $dir = AVATARS . "/.builds/$id";
             @mkdir($dir, 0755, true);
             file_put_contents("$dir/spec.json", json_encode(person_normalize($in)));
@@ -2644,6 +4625,18 @@ if ($a !== '') {
             $id = $_GET['id'] ?? '';
             if (!valid_id($id) || !is_dir(AVATARS . "/.builds/$id")) json_out(['error' => 'not found'], 404);
             json_out(read_json(AVATARS . "/.builds/$id/status.json"));
+        case 'person_photo':   // a front photo for the builder's likeness step → {photo}: pass it back as "photo" in person_make
+            $f = $_FILES['image'] ?? null;
+            if (!$f || $f['error'] !== UPLOAD_ERR_OK) json_out(['error' => 'No picture received.'], 400);
+            $ext = strtolower(pathinfo($f['name'], PATHINFO_EXTENSION)); $ext = $ext === 'jpeg' ? 'jpg' : $ext;
+            $info = @getimagesize($f['tmp_name']);
+            if (!in_array($ext, ['jpg', 'png', 'webp'], true) || !$info || !in_array($info[2], [IMAGETYPE_JPEG, IMAGETYPE_PNG, IMAGETYPE_WEBP], true)) json_out(['error' => 'Use a JPG, PNG or WebP picture.'], 400);
+            if ($f['size'] > 25e6) json_out(['error' => 'That picture is over 25 MB. Use a smaller one.'], 400);
+            @mkdir(PERSON_PHOTOS, 0700, true);
+            foreach (glob(PERSON_PHOTOS . '/*') ?: [] as $old) if (filemtime($old) < time() - 86400) @unlink($old);   // photos nobody built from
+            $name = new_id() . ".$ext";
+            move_uploaded_file($f['tmp_name'], PERSON_PHOTOS . "/$name"); @chmod(PERSON_PHOTOS . "/$name", 0600);
+            json_out(['photo' => $name]);
         case 'person_delete':   // only people made here; the downloaded defaults stay
             $k = (string)($_POST['id'] ?? '');
             if (!preg_match('/^[\w.-]+$/', $k) || isset(AVATAR_DEFAULTS[$k]) || empty(avatar_meta($k)['made'])) json_out(['error' => 'Only people built here can be deleted.'], 400);
@@ -2665,8 +4658,160 @@ if ($a !== '') {
         case 'scene_gen':
             $prompt = trim((string)($_POST['prompt'] ?? ''));
             if ($prompt === '') json_out(['error' => 'Describe the scene first.'], 400);
-            if (!engine_ready() && ($_POST['provider'] ?? '') !== 'free') json_out(['error' => 'Install the engine first (Voice Swap page), or pick the free no-account service.'], 400);
-            try { json_out(scene_generate($prompt, (string)($_POST['aspect'] ?? '16:9'), (string)($_POST['style'] ?? ''), (string)($_POST['provider'] ?? 'hf'))); }
+            $prov = scene_provider((string)($_POST['provider'] ?? ''));
+            if (!engine_ready() && $prov !== 'free') json_out(['error' => 'Install the engine first (Voice Swap page), or pick the free no-account service.'], 400);
+            try { json_out(scene_generate($prompt, (string)($_POST['aspect'] ?? '16:9'), (string)($_POST['style'] ?? ''), $prov, false)); }   // local → {job}: poll scene_status
+            catch (Throwable $e) { json_out(['error' => $e->getMessage()], 502); }
+        case 'scene_status':
+            $id = (string)($_GET['id'] ?? ''); $d = SCENES . "/.jobs/$id";
+            if (!valid_id($id) || !is_dir($d)) json_out(['error' => 'not found'], 404);
+            $st = tool_job_status($d); $j = read_json("$d/job.json"); $mf = preg_replace('/\.jpg$/', '.json', $j['out'] ?? '');
+            if ($st['state'] === 'error') @unlink($mf);
+            json_out($st + ['file' => basename($j['out'] ?? ''), 'title' => read_json($mf)['title'] ?? '', 'source' => 'Z-Image Turbo (made here)']);
+        case 'clips':
+            json_out(media_list(CLIPS, '/\.mp4$/i'));
+        case 'clip_gen':   // prompt and/or image (a scene file) → a few seconds of Wan 2.2 video in clips/
+            $prompt = trim((string)($_POST['prompt'] ?? '')); $image = basename((string)($_POST['image'] ?? ''));
+            if ($prompt === '' && $image === '') json_out(['error' => 'Describe the clip, or pick a picture to animate.'], 400);
+            if (!engine_ready()) json_out(['error' => 'Install the engine first (Voice Swap page).'], 400);
+            try { json_out(clip_start($prompt, $image, (string)($_POST['aspect'] ?? '16:9'), clampf($_POST['seconds'] ?? 3, 1, 6, 3), (int)clampf($_POST['steps'] ?? 20, 6, 50, 20))); }
+            catch (Throwable $e) { json_out(['error' => $e->getMessage()], 400); }
+        case 'clip_status':
+            $id = (string)($_GET['id'] ?? ''); $d = CLIPS . "/.jobs/$id";
+            if (!valid_id($id) || !is_dir($d)) json_out(['error' => 'not found'], 404);
+            $st = tool_job_status($d); $j = read_json("$d/job.json");
+            if ($st['state'] === 'error') @unlink(preg_replace('/\.mp4$/', '.json', $j['out'] ?? ''));
+            json_out($st + ['file' => basename($j['out'] ?? '')]);
+        case 'extras':
+            write_engine_files();   // so extras.sh is current before an install starts
+            json_out(extras_status());
+        case 'extras_install':   // painter (Z-Image Turbo) or video (Wan 2.2); optional checkpoint = a Wan2.2-TI2V-5B folder you already have
+            $what = (string)($_POST['what'] ?? '');
+            if (!in_array($what, ['painter', 'video', 'lipsync'], true)) json_out(['error' => 'what = painter | video | lipsync'], 400);
+            if (!engine_ready()) json_out(['error' => 'Install the engine first (Voice Swap page).'], 400);
+            $ck = rtrim(trim((string)($_POST['checkpoint'] ?? '')), '/');
+            if ($what === 'video' && $ck !== '') {
+                if (!is_file("$ck/config.json") || !glob("$ck/diffusion_pytorch_model*.safetensors")) json_out(['error' => "That folder doesn't look like Wan2.2-TI2V-5B (no config.json and diffusion_pytorch_model*.safetensors in it)."], 400);
+                $sv = read_json(SETTINGS); $sv['wan_checkpoint'] = $ck; file_put_contents(SETTINGS, json_encode($sv, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+            }
+            $need = $what === 'painter' ? 10 : ($what === 'lipsync' ? 9 : ($ck !== '' ? 12 : 48));
+            if (disk_free_space(BASE) < $need * 1e9) json_out(['error' => "This needs about $need GB free during the install, and this disk has " . round(disk_free_space(BASE) / 1e9) . ' GB.'], 400);
+            extras_install($what, $ck);
+            json_out(['ok' => true]);
+        case 'show_director':
+            $prompt = trim((string)($_POST['prompt'] ?? ''));
+            if ($prompt === '') json_out(['error' => 'Describe the episode first.'], 400);
+            try { json_out(['episode' => show_director($prompt, trim((string)($_POST['model'] ?? '')))]); }
+            catch (Throwable $e) { json_out(['error' => $e->getMessage()], 502); }
+        case 'show_make':   // JSON body = an episode (see the Showrunner page, or skills/toon-studio/SKILL.md), or {"prompt": "…"}
+            if (!engine_ready()) json_out(['error' => 'Engine not installed yet — open the app and click Install engine.'], 400);
+            write_engine_files();
+            $in = json_decode((string)file_get_contents('php://input'), true);
+            if (!is_array($in)) $in = json_decode((string)($_POST['spec'] ?? ''), true);
+            if (!is_array($in)) json_out(['error' => 'Send the episode as a JSON body.'], 400);
+            try { json_out(['id' => show_start($in)]); }
+            catch (Throwable $e) { json_out(['error' => $e->getMessage()], 502); }
+        case 'show_status':
+            $id = (string)($_GET['id'] ?? '');
+            if (!valid_id($id) || !is_dir(SHOWS . "/$id")) json_out(['error' => 'not found'], 404);
+            json_out(show_status($id));
+        case 'shows':
+            json_out(show_list());
+        case 'show_get':
+            $id = (string)($_GET['id'] ?? '');
+            if (!valid_id($id) || !is_file(SHOWS . "/$id/spec.json")) json_out(['error' => 'not found'], 404);
+            json_out(array_diff_key(read_json(SHOWS . "/$id/spec.json"), ['_env' => 1]));
+        case 'show_delete':
+            $id = (string)($_POST['id'] ?? '');
+            if (!valid_id($id) || !is_dir(SHOWS . "/$id")) json_out(['error' => 'not found'], 404);
+            $pid = (int)@file_get_contents(SHOWS . "/$id/pid"); if (pid_alive($pid)) { posix_kill(-$pid, 15); posix_kill($pid, 15); }
+            exec('rm -rf ' . escapeshellarg(SHOWS . "/$id"));
+            json_out(['ok' => true]);
+        case 'jobs_all':
+            json_out(jobs_all());
+        case 'recipes':
+            json_out(['recipes' => recipes_list(), 'python' => find_bin('python3') !== null, 'runs' => array_map(fn($d) => recipe_status(basename($d)), array_slice(array_reverse(glob(RECIPES . '/.runs/*', GLOB_ONLYDIR) ?: []), 0, 6))]);
+        case 'recipe_run':
+            try { json_out(['id' => recipe_run((string)($_POST['name'] ?? ''), (string)($_POST['args'] ?? ''))]); }
+            catch (Throwable $e) { json_out(['error' => $e->getMessage()], 400); }
+        case 'recipe_status':
+            $id = (string)($_GET['id'] ?? '');
+            if (!valid_id($id) || !is_dir(RECIPES . "/.runs/$id")) json_out(['error' => 'not found'], 404);
+            json_out(recipe_status($id));
+        case 'footage':
+            json_out(footage_list());
+        case 'footage_upload':   // a green-screen clip of you (file field "video")
+            $f = $_FILES['video'] ?? null;
+            if (!$f || $f['error'] !== UPLOAD_ERR_OK) json_out(['error' => 'No video received. (Big files need the app started with "php index.php", which allows 1 GB uploads.)'], 400);
+            if (!engine_ready()) json_out(['error' => 'Install the engine first (Voice Swap page).'], 400);
+            try { json_out(video_import($f['tmp_name'], FOOTAGE, pathinfo($f['name'], PATHINFO_FILENAME), 'footage')); }
+            catch (Throwable $e) { json_out(['error' => $e->getMessage()], 400); }
+        case 'footage_index':   // re-index a clip with new key settings
+            $file = basename((string)($_POST['file'] ?? ''));
+            if (!is_file(FOOTAGE . "/$file")) json_out(['error' => 'not found'], 404);
+            json_out(['job' => index_start('footage', $file, ['color' => hexcol($_POST['color'] ?? '', ''), 'similarity' => isset($_POST['similarity']) ? clampf($_POST['similarity'], 0.03, 0.5, 0.12) : '',
+                'blend' => isset($_POST['blend']) ? clampf($_POST['blend'], 0, 0.5, 0.08) : '', 'despill' => isset($_POST['despill']) ? clampf($_POST['despill'], 0, 1, 0.6) : ''])]);
+        case 'footage_save_index':   // the page's face analysis (MediaPipe: idle windows, neutral frames, the face box) → merged into the index; sheets are redrawn
+            $file = basename((string)($_POST['file'] ?? '')); $in = json_decode((string)($_POST['index'] ?? ''), true);
+            if (!is_file(FOOTAGE . "/$file") || !is_array($in)) json_out(['error' => 'bad request'], 400);
+            $b = FOOTAGE . '/' . pathinfo($file, PATHINFO_FILENAME); $idx = read_json("$b.index.json");
+            foreach (['face', 'idle', 'talk', 'neutral', 'analyzed', 'frames', 'blinks'] as $k) if (array_key_exists($k, $in)) $idx[$k] = $in[$k];
+            file_put_contents("$b.index.json", json_encode($idx, JSON_UNESCAPED_SLASHES));
+            json_out(['ok' => true, 'job' => index_start('footage', $file, $idx['key'] ?? [])]);
+        case 'footage_status':
+        case 'broll_status':
+            $id = (string)($_GET['id'] ?? ''); $d = ($a === 'footage_status' ? FOOTAGE : BROLL) . "/.jobs/$id";
+            if (!valid_id($id) || !is_dir($d)) json_out(['error' => 'not found'], 404);
+            json_out(tool_job_status($d) + ['file' => basename((string)(read_json("$d/job.json")['file'] ?? ''))]);
+        case 'footage_delete':
+        case 'broll_delete':
+            $dir = $a === 'footage_delete' ? FOOTAGE : BROLL; $f = basename((string)($_POST['file'] ?? ''));
+            if (!preg_match('/^[\w.-]+\.mp4$/i', $f) || !is_file("$dir/$f")) json_out(['error' => 'not found'], 404);
+            foreach (glob("$dir/" . pathinfo($f, PATHINFO_FILENAME) . '.*') ?: [] as $x) @unlink($x);
+            json_out(['ok' => true]);
+        case 'broll':
+            json_out(broll_list());
+        case 'broll_upload':   // a screen recording or any background video (file field "video")
+            $f = $_FILES['video'] ?? null;
+            if (!$f || $f['error'] !== UPLOAD_ERR_OK) json_out(['error' => 'No video received. (Big files need the app started with "php index.php", which allows 1 GB uploads.)'], 400);
+            if (!engine_ready()) json_out(['error' => 'Install the engine first (Voice Swap page).'], 400);
+            try { json_out(video_import($f['tmp_name'], BROLL, pathinfo($f['name'], PATHINFO_FILENAME), 'broll')); }
+            catch (Throwable $e) { json_out(['error' => $e->getMessage()], 400); }
+        case 'real_make':   // JSON body: {footage, broll, script|audio, voice, avatar:{corner,size,…}, key, subtitles, captions, aspect, …} → {id}; then real_status
+            if (!engine_ready()) json_out(['error' => 'Engine not installed yet — open the app and click Install engine.'], 400);
+            write_engine_files();
+            $in = json_decode((string)file_get_contents('php://input'), true);
+            if (!is_array($in)) $in = json_decode((string)($_POST['spec'] ?? ''), true);
+            if (!is_array($in)) json_out(['error' => 'Send the spec as a JSON body.'], 400);
+            try { json_out(['id' => real_start($in)]); }
+            catch (Throwable $e) { json_out(['error' => $e->getMessage()], 400); }
+        case 'real_status':
+            $id = (string)($_GET['id'] ?? '');
+            if (!valid_id($id) || !is_dir(REALS . "/$id")) json_out(['error' => 'not found'], 404);
+            json_out(real_status($id));
+        case 'reals':
+            json_out(real_list());
+        case 'real_get':
+            $id = (string)($_GET['id'] ?? '');
+            if (!valid_id($id) || !is_file(REALS . "/$id/spec.json")) json_out(['error' => 'not found'], 404);
+            json_out(array_diff_key(read_json(REALS . "/$id/spec.json"), ['_env' => 1]));
+        case 'real_delete':
+            $id = (string)($_POST['id'] ?? '');
+            if (!valid_id($id) || !is_dir(REALS . "/$id")) json_out(['error' => 'not found'], 404);
+            $pid = (int)@file_get_contents(REALS . "/$id/pid"); if (pid_alive($pid)) { posix_kill(-$pid, 15); posix_kill($pid, 15); }
+            exec('rm -rf ' . escapeshellarg(REALS . "/$id"));
+            json_out(['ok' => true]);
+        case 'real_script':   // rough notes → a script in your words (the local model)
+            $notes = trim((string)($_POST['notes'] ?? ''));
+            if ($notes === '') json_out(['error' => 'Jot down what the video is about first.'], 400);
+            try { json_out(['script' => script_writer($notes, (int)clampf($_POST['seconds'] ?? 45, 15, 180, 45), in_array($_POST['tone'] ?? '', ['conversational', 'energetic', 'calm', 'funny', 'serious'], true) ? $_POST['tone'] : 'conversational', trim((string)($_POST['model'] ?? '')))]); }
+            catch (Throwable $e) { json_out(['error' => $e->getMessage()], 502); }
+        case 'vision_models':
+            json_out(['models' => vision_models()]);
+        case 'vision_check':   // ask a local vision model about a picture in footage/, broll/ or reals/
+            $img = (string)($_POST['image'] ?? '');
+            if (!preg_match('#^(footage|broll|reals/[\w-]+)/[\w.-]+\.(jpe?g|png)$#', $img)) json_out(['error' => 'bad picture path'], 400);
+            try { json_out(['answer' => vision_check(BASE . "/$img", (string)($_POST['question'] ?? 'Describe this picture.'), trim((string)($_POST['model'] ?? '')))]); }
             catch (Throwable $e) { json_out(['error' => $e->getMessage()], 502); }
         case 'music':
             json_out(['tracks' => media_list(MUSIC, '/\.(mp3|wav|m4a|ogg|flac)$/i'), 'musicgen' => musicgen_ready(), 'free_gb' => round(disk_free_space(BASE) / 1e9, 1)]);
@@ -2696,8 +4841,8 @@ if ($a !== '') {
             json_out($st);
         case 'media_delete':   // a scene or a music track
             $kind = $_POST['kind'] ?? ''; $f = basename((string)($_POST['file'] ?? ''));
-            $dir = ['scene' => SCENES, 'music' => MUSIC][$kind] ?? null;
-            if (!$dir || !preg_match('/^[\w.-]+\.(jpe?g|png|webp|mp3|wav|m4a|ogg|flac)$/i', $f) || !is_file("$dir/$f")) json_out(['error' => 'not found'], 404);
+            $dir = ['scene' => SCENES, 'music' => MUSIC, 'clip' => CLIPS][$kind] ?? null;
+            if (!$dir || !preg_match('/^[\w.-]+\.(jpe?g|png|webp|mp3|wav|m4a|ogg|flac|mp4)$/i', $f) || !is_file("$dir/$f")) json_out(['error' => 'not found'], 404);
             if (!@unlink("$dir/$f")) json_out(['error' => "Couldn't delete $f."], 500);
             @unlink("$dir/" . preg_replace('/\.\w+$/', '.json', $f));
             json_out(['ok' => true]);
@@ -2722,7 +4867,30 @@ if ($a !== '') {
             file_put_contents(GAMES . "/$id/game.json", json_encode($spec, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
             file_put_contents(GAMES . "/$id/index.html", $html);
             if (preg_match('#^data:image/jpeg;base64,([A-Za-z0-9+/=]+)$#', (string)($_POST['thumb'] ?? ''), $m)) file_put_contents(GAMES . "/$id/thumb.jpg", base64_decode($m[1]));
+            $b = (string)($_POST['build'] ?? '');   // a headless build (?a=game_make) reports back through the same save
+            if (valid_id($b) && is_dir(GAMES . "/.builds/$b")) file_put_contents(GAMES . "/.builds/$b/done.json", json_encode(['id' => $id]));
             json_out(['id' => $id]);
+        case 'game_make':   // agents / scripts: JSON body = a loose game spec, or {"prompt": "…"} for the Director → {id}; then game_status
+            if (!engine_ready()) json_out(['error' => 'Engine not installed yet — open the app and click Install engine.'], 400);
+            write_engine_files();
+            $in = json_decode((string)file_get_contents('php://input'), true);
+            if (!is_array($in)) $in = json_decode((string)($_POST['spec'] ?? ''), true);
+            if (!is_array($in)) json_out(['error' => 'Send the game spec as a JSON body ({"prompt": "…"} or {title, mold, cast, levels, rules, music, voice}).'], 400);
+            try { json_out(['id' => game_build_start($in, (string)($in['model'] ?? ''))]); }
+            catch (Throwable $e) { json_out(['error' => $e->getMessage()], 502); }
+        case 'game_status':
+            $id = (string)($_GET['id'] ?? '');
+            if (!valid_id($id) || !is_dir(GAMES . "/.builds/$id")) json_out(['error' => 'not found'], 404);
+            json_out(game_build_status($id));
+        case 'game_build_get':   // the Game Creator page in build mode (?p=game&build=<id>) asks what to build
+            $id = (string)($_GET['id'] ?? ''); $d = GAMES . "/.builds/$id";
+            if (!valid_id($id) || !is_file("$d/spec.json")) json_out(['error' => 'not found'], 404);
+            $b = read_json("$d/spec.json"); $st = read_json("$d/status.json");
+            json_out(array_diff_key($b, ['_env' => 1]) + ['voice_files' => $st['voice_files'] ?? [], 'music_ok' => $st['music_ok'] ?? null]);
+        case 'game_build_report':
+            $id = (string)($_POST['id'] ?? '');
+            if (valid_id($id) && is_dir(GAMES . "/.builds/$id")) file_put_contents(GAMES . "/.builds/$id/done.json", json_encode(['error' => mb_substr((string)($_POST['error'] ?? 'The page could not build the game.'), 0, 600)]));
+            json_out(['ok' => true]);
         case 'game_delete':
             $id = (string)($_POST['id'] ?? '');
             if (!valid_id($id) || !is_dir(GAMES . "/$id")) json_out(['error' => 'not found'], 404);
@@ -2808,9 +4976,16 @@ if ($a !== '') {
                 if (!empty($in['scene'])) {   // "scene": "a rainy neon street" | {"prompt": …} | {"file": "/path/to/picture.jpg"}
                     $sc = is_array($in['scene']) ? $in['scene'] : ['prompt' => (string)$in['scene']];
                     $style = (string)($in['style'] ?? $in['character']['style'] ?? (TOON_PRESETS[$in['preset'] ?? '']['style'] ?? ''));
-                    $file = !empty($sc['file']) ? media_import((string)$sc['file'], SCENES, ['jpg', 'jpeg', 'png', 'webp'], (string)($sc['title'] ?? ''))
-                        : scene_generate((string)($sc['prompt'] ?? ''), (string)($in['aspect'] ?? '16:9'), $style, (string)($sc['provider'] ?? 'hf'))['file'];
-                    if (!$file) throw new RuntimeException('Scene picture not found: ' . ($sc['file'] ?? ''));
+                    $aspect = (string)($in['aspect'] ?? '16:9');
+                    if (!empty($sc['clip'])) {   // {"clip": "<file in clips/>"}: an existing Wan clip loops behind the toon
+                        $file = basename((string)$sc['clip']);
+                        if (!is_file(CLIPS . "/$file")) throw new RuntimeException("Clip not found: $file (see options → clips)");
+                    } else {
+                        $file = !empty($sc['file']) ? media_import((string)$sc['file'], SCENES, ['jpg', 'jpeg', 'png', 'webp'], (string)($sc['title'] ?? ''))
+                            : (!empty($sc['prompt']) || !empty($sc['file']) || empty($sc['animate']) ? scene_generate((string)($sc['prompt'] ?? ''), $aspect, $style, scene_provider((string)($sc['provider'] ?? '')))['file'] : '');
+                        if (!$file) throw new RuntimeException('Scene picture not found: ' . ($sc['file'] ?? ''));
+                        if (!empty($sc['animate'])) $file = clip_wait(clip_start((string)($sc['motion'] ?? $sc['prompt'] ?? ''), $file, $aspect, clampf($sc['seconds'] ?? 3, 1, 6, 3))['id']);   // "animate": true → Wan turns the picture into a looping clip (minutes)
+                    }
                     $in['character'] = (is_array($in['character'] ?? null) ? $in['character'] : []) + ['bg' => 'image', 'bgImage' => $file];
                     $in['character']['bg'] = 'image'; $in['character']['bgImage'] = $file;
                 }
@@ -2830,7 +5005,7 @@ if ($a !== '') {
             $dir = PROJECTS . "/$id";
             mkdir($dir, 0755, true);
             $spec['_env'] = ['port' => (int)($_SERVER['SERVER_PORT'] ?? PORT), 'chrome' => find_chrome(), 'jobs' => JOBS, 'toons' => TOONS, 'renders' => RENDERS, 'music' => MUSIC,
-                'voice_path' => $spec['voice'] !== '' ? voice_file($spec['voice']) : ''];
+                'voice_path' => $spec['voice'] !== '' ? voice_file($spec['voice']) : '', 'ollama' => ollama_url()];
             file_put_contents("$dir/spec.json", json_encode($spec, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
             spawn_worker($dir, '--make');
             json_out(['id' => $id, 'spec' => array_diff_key($spec, ['_env' => 1]), 'renderer' => $spec['_env']['chrome'] ? 'headless chrome' : null]);
@@ -2875,11 +5050,13 @@ if (PHP_SAPI === 'cli-server') {   // the 3D renderer's library and people are p
     $path = rawurldecode((string)parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH));
     $types = ['js' => 'text/javascript', 'glb' => 'model/gltf-binary', 'jpg' => 'image/jpeg', 'jpeg' => 'image/jpeg', 'png' => 'image/png', 'webp' => 'image/webp',
         'mp3' => 'audio/mpeg', 'wav' => 'audio/wav', 'm4a' => 'audio/mp4', 'ogg' => 'audio/ogg', 'flac' => 'audio/flac',
-        'mjs' => 'text/javascript', 'wasm' => 'application/wasm', 'task' => 'application/octet-stream', 'html' => 'text/html; charset=utf-8'];
-    if (preg_match('#^/(vendor/three|vendor/mediapipe|avatars|scenes|music|games)/#', $path) && (str_contains($path, '..') || !is_file(BASE . $path) || !isset($types[strtolower(pathinfo($path, PATHINFO_EXTENSION))]))) {
+        'mjs' => 'text/javascript', 'wasm' => 'application/wasm', 'task' => 'application/octet-stream', 'html' => 'text/html; charset=utf-8', 'mp4' => 'video/mp4', 'webm' => 'video/webm'];
+    if (preg_match('#^/(vendor/three|vendor/mediapipe|avatars|scenes|music|games|clips|footage|broll|reals)/#', $path) && (str_contains($path, '..') || !is_file(BASE . $path) || !isset($types[strtolower(pathinfo($path, PATHINFO_EXTENSION))]))) {
         http_response_code(404); header('Content-Type: text/plain'); exit('not found');
     }
-    if (preg_match('#^/(vendor/three|vendor/mediapipe|avatars|scenes|music|games)/[\w./-]+$#', $path)) {
+    if (preg_match('#^/(vendor/three|vendor/mediapipe|avatars|scenes|music|games|clips|footage|broll|reals)/[\w./-]+$#', $path)) {
+        if (str_ends_with(strtolower($path), '.mp4')) serve_file(BASE . $path, 'video/mp4');   // range requests, so <video loop> can seek
+        if (str_ends_with(strtolower($path), '.webm')) serve_file(BASE . $path, 'video/webm');
         header('Content-Type: ' . $types[strtolower(pathinfo($path, PATHINFO_EXTENSION))]);
         header('Cache-Control: max-age=3600');
         if (isset($_GET['dl']) && str_ends_with($path, '.html')) header('Content-Disposition: attachment; filename="' . preg_replace('/[^\w.-]+/', '-', basename($_GET['dl']) ?: 'game') . '.html"');
@@ -2887,13 +5064,13 @@ if (PHP_SAPI === 'cli-server') {   // the 3D renderer's library and people are p
         readfile(BASE . $path); exit;
     }
 }
-$page = in_array($_GET['p'] ?? '', ['toon', 'game'], true) ? $_GET['p'] : 'swap';
+$page = in_array($_GET['p'] ?? '', ['toon', 'game', 'show', 'real'], true) ? $_GET['p'] : 'swap';
 ?><!doctype html>
 <html lang="en" data-theme="gold">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Toon House · <?= ['swap' => 'Voice Swap', 'toon' => 'Toon Lab', 'game' => 'Game Creator'][$page] ?></title>
+<title>Toon House · <?= ['swap' => 'Voice Swap', 'toon' => 'Toon Lab', 'game' => 'Game Creator', 'show' => 'Showrunner', 'real' => 'Real Avatar'][$page] ?></title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=JetBrains+Mono:wght@400;600&family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
 <?php if ($page === 'toon' || $page === 'game'): ?>
@@ -3023,6 +5200,58 @@ details.fold[open] > summary { margin-bottom:10px; }
 .galbar input, .galbar select { width:auto; flex:1 1 140px; padding:5px 8px; }
 .galbar .chips { flex:0 0 auto; }
 .gallery { display:grid; grid-template-columns:repeat(auto-fill, minmax(170px, 1fr)); gap:10px; }
+/* Showrunner */
+main.show { grid-template-columns:minmax(0,460px) minmax(0,1fr); max-width:1600px; }
+.sc-card { border:2px solid var(--edge); background:var(--well); padding:10px; margin-top:10px; }
+.sc-card .sc-head { display:flex; align-items:center; gap:6px; margin-bottom:6px; }
+.sc-card .sc-head b { flex:1; font-size:13px; }
+.sc-card .sc-head button { padding:2px 7px; font-size:12px; }
+.sc-card textarea { min-height:70px; }
+.sc-card .row + .row { margin-top:6px; }
+.sc-card select, .sc-card input[type=text] { width:100%; }
+.sc-card .two { display:grid; grid-template-columns:1fr 1fr; gap:6px; }
+.kind { font-size:11px; padding:1px 6px; border:1px solid var(--edge); background:var(--panel); white-space:nowrap; }
+.kind.title { color:#ffd23f; } .kind.talk { color:var(--hi); } .kind.clip { color:#7fe3ff; }
+.jobrow { display:grid; grid-template-columns:86px minmax(0,1fr) auto; gap:8px; align-items:center; padding:6px 0; border-bottom:1px solid var(--edge); font-size:12.5px; }
+.jobrow > div { min-width:0; }
+.jobrow:last-child { border-bottom:0; }
+.jobrow .bar { margin:4px 0 0; height:8px; }
+.jobrow .t { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.engrow { display:grid; grid-template-columns:1fr auto; gap:8px; align-items:start; padding:8px 0; border-bottom:1px solid var(--edge); }
+.engrow:last-child { border-bottom:0; }
+.engrow .ok { color:var(--hi); font-weight:600; } .engrow .no { color:var(--muted); }
+.engrow pre { margin:6px 0 0; font-size:11px; max-height:120px; overflow:auto; background:var(--well); padding:6px; white-space:pre-wrap; }
+.recipe { padding:8px 0; border-bottom:1px solid var(--edge); }
+.recipe:last-child { border-bottom:0; }
+.recipe code { font-size:11.5px; background:var(--well); padding:1px 5px; cursor:pointer; }
+.recipe .row { margin-top:6px; }
+.recipe pre { margin:6px 0 0; font-size:11px; max-height:160px; overflow:auto; background:var(--well); padding:6px; white-space:pre-wrap; }
+#showPlayer { width:100%; max-height:60vh; background:#000; display:block; }
+/* Real Avatar */
+main.real { grid-template-columns:minmax(0,500px) minmax(0,1fr); max-width:1600px; }
+.checker { background-color:#8a8fa8; background-image:linear-gradient(45deg,#6f7490 25%,transparent 25%),linear-gradient(-45deg,#6f7490 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#6f7490 75%),linear-gradient(-45deg,transparent 75%,#6f7490 75%); background-size:16px 16px; background-position:0 0,0 8px,8px -8px,-8px 0; }
+.fcard { border:2px solid var(--edge); background:var(--well); padding:8px; margin-top:8px; display:grid; grid-template-columns:120px 1fr; gap:10px; }
+.fcard.on { outline:3px solid var(--hi); }
+.fcard video, .fcard img.sheetimg { width:120px; height:120px; object-fit:contain; display:block; }
+.fcard .ft { font-weight:600; font-size:13px; }
+.fcard .facts { font-size:11.5px; color:var(--muted); margin:3px 0 6px; }
+.fcard .acts { display:flex; flex-wrap:wrap; gap:4px; }
+.fcard .acts button { padding:3px 7px; font-size:12px; }
+.fcard .more { grid-column:1/-1; }
+.fcard .more img { width:100%; display:block; margin-top:6px; border:1px solid var(--edge); }
+.sheets img { width:100%; display:block; margin-top:6px; border:1px solid var(--edge); cursor:zoom-in; }
+.corner-pick { display:grid; grid-template-columns:repeat(3,1fr); gap:4px; width:150px; }
+.corner-pick button { padding:6px 0; font-size:12px; }
+#realPreview { display:block; margin:auto; width:auto; height:auto; max-width:100%; max-height:62vh; background:#000; }   /* only max sizes, so the canvas keeps its aspect */
+.cap-row { display:grid; grid-template-columns:70px 1fr 54px 54px 40px 28px; gap:4px; margin-top:6px; align-items:center; }
+.cap-row input, .cap-row select { padding:4px 6px; font-size:12.5px; }
+.stage-list { font-size:12.5px; margin-top:8px; }
+.stage-list div { display:flex; gap:8px; padding:3px 0; align-items:center; }
+#realPlayer { width:100%; max-height:62vh; background:#000; display:block; }
+.note { font-size:12.5px; padding:8px 10px; border:1px dashed var(--edge); margin-top:8px; }
+.ep-scenes { margin-top:8px; font-size:12.5px; }
+.ep-scenes div { display:flex; gap:8px; align-items:center; padding:3px 0; }
+.ep-scenes .state { min-width:60px; text-align:center; }
 .gcard { border:2px solid var(--edge); background:var(--well); cursor:pointer; display:flex; flex-direction:column; }
 .gcard:hover { outline:3px solid var(--hi); }
 .gcard.flash { animation:flash 1.2s 3; } @keyframes flash { 50% { outline:4px solid var(--hi); } }
@@ -3226,8 +5455,8 @@ details.fold[open] > summary { margin-bottom:10px; }
 <body>
 <header>
   <h1>Toon <span>House</span></h1>
-  <nav class="tabs"><a href="./" class="<?= $page === 'swap' ? 'on' : '' ?>">🎤 Voice Swap</a><a href="?p=toon" class="<?= $page === 'toon' ? 'on' : '' ?>">🎬 Toon Lab</a><a href="?p=game" class="<?= $page === 'game' ? 'on' : '' ?>">🕹 Game Creator</a></nav>
-  <div class="tag"><?= ['swap' => 'put your voice on any song · runs 100% on this Mac', 'toon' => 'build a toon · it lip-syncs & moves to your audio', 'game' => 'your toons star in games you design · no engine, no API'][$page] ?></div>
+  <nav class="tabs"><a href="./" class="<?= $page === 'swap' ? 'on' : '' ?>">🎤 Voice Swap</a><a href="?p=toon" class="<?= $page === 'toon' ? 'on' : '' ?>">🎬 Toon Lab</a><a href="?p=game" class="<?= $page === 'game' ? 'on' : '' ?>">🕹 Game Creator</a><a href="?p=show" class="<?= $page === 'show' ? 'on' : '' ?>">🎞 Showrunner</a><a href="?p=real" class="<?= $page === 'real' ? 'on' : '' ?>">🧑 Real Avatar</a></nav>
+  <div class="tag"><?= ['swap' => 'put your voice on any song · runs 100% on this Mac', 'toon' => 'build a toon · it lip-syncs & moves to your audio', 'game' => 'your toons star in games you design · no engine, no API', 'show' => 'chain scenes into episodes · every engine and job in one place', 'real' => 'you, on green screen, saying anything in your own voice · over your screen recording'][$page] ?></div>
   <div class="themes" id="themes">
     <button data-t="classic">Classic</button><button data-t="dark">Dark</button><button data-t="gold">All Gold Everything</button><button data-t="iced">Iced Out</button><button data-t="studio">Studio</button>
   </div>
@@ -3307,7 +5536,7 @@ document.addEventListener('DOMContentLoaded', () => document.querySelectorAll('d
         <textarea id="ttsText" rows="7" placeholder="Type or paste what you want said in your voice… or drop a .txt / .md file here"></textarea>
         <div class="row"><button type="button" class="shrink" id="ttsLoad">📄 Load .txt / .md</button><span class="meta" id="ttsCount"></span></div>
         <input type="file" id="ttsFile" accept=".txt,.md,.markdown,text/plain,text/markdown" hidden>
-        <div class="row"><label class="shrink lbl">Reader</label><select name="tts_voice" id="ttsVoice"><?php foreach (TTS_VOICES as [$v, $l]) echo "<option value=\"$v\">$l</option>"; ?></select></div>
+        <div class="row"><label class="shrink lbl">Reader</label><select name="tts_voice" id="ttsVoice"><?= tts_voice_options() ?></select></div>
         <div class="field"><label>Speed</label><input type="range" name="tts_speed" min="0.7" max="1.4" step="0.05" value="1"><output></output></div>
         <div class="hint">An AI voice reads your text first (it sets the pace and accent — pick one close to yours), then it's swapped into your voice. Markdown is cleaned up (headings, bullets, links) before reading.</div>
       </div>
@@ -3615,7 +5844,7 @@ checkEngine(); loadVoices(); poll();
         <div class="row"><button type="button" class="shrink" id="ttsLoad">📄 Load .txt / .md</button><span class="meta" id="ttsCount"></span></div>
         <input type="file" id="ttsFile" accept=".txt,.md,.markdown,text/plain,text/markdown" hidden>
         <div class="row"><label class="shrink lbl">Voice</label><select id="ttsSpeaker"></select></div>
-        <div class="row"><label class="shrink lbl">Reader</label><select id="ttsVoice"><?php foreach (TTS_VOICES as [$v, $l]) echo "<option value=\"$v\">$l</option>"; ?></select></div>
+        <div class="row"><label class="shrink lbl">Reader</label><select id="ttsVoice"><?= tts_voice_options() ?></select></div>
         <div class="field"><label>Speed</label><input type="range" id="ttsSpeed" min="0.7" max="1.4" step="0.05" value="1"><output></output></div>
         <button class="big" id="speakBtn" type="button">🗣 Speak it</button>
         <div class="hint">Your voice: an AI reader speaks it, then Seed-VC swaps in your saved voice (record one on the Voice Swap page). AI voice only is faster. Then it syncs the mouth automatically.</div>
@@ -3753,10 +5982,14 @@ try { const s = JSON.parse(localStorage.toonChar || 'null'); if (s) C = normChar
 const saveLocal = () => { try { localStorage.toonChar = JSON.stringify(C); } catch (e) {} };
 const pick = a => a[Math.floor(Math.random() * a.length)];
 const SCN = {list: null, img: {}};
-function sceneImg(f) {   // a scene picture (scenes/), decoded; null while it loads
+function sceneImg(f) {   // a scene picture (scenes/) or a looping clip (clips/*.mp4), decoded; null while it loads
   if (!f) return null;
   let im = SCN.img[f];
-  if (!im) { im = SCN.img[f] = new Image(); im.src = 'scenes/' + encodeURIComponent(f); }
+  if (!im) {
+    if (/\.mp4$/i.test(f)) { im = SCN.img[f] = Object.assign(document.createElement('video'), {src: 'clips/' + encodeURIComponent(f), muted: true, loop: true, playsInline: true, autoplay: true, preload: 'auto'}); im.play().catch(() => {}); }
+    else { im = SCN.img[f] = new Image(); im.src = 'scenes/' + encodeURIComponent(f); }
+  }
+  if (im.tagName === 'VIDEO') { if (im.readyState < 2 || !im.videoWidth) return null; if (im.paused) im.play().catch(() => {}); return im; }
   return im.complete && im.naturalWidth ? im : null;
 }
 </script>
@@ -3777,7 +6010,7 @@ function buildOpts() {
     const g = b.parentElement, k = g.dataset.k;
     if (g.dataset.multi) { const s = new Set(C[k]); s.has(b.dataset.v) ? s.delete(b.dataset.v) : s.add(b.dataset.v); C[k] = [...s]; }
     else C[k] = b.dataset.v;
-    if (k === 'avatar') { const hc = ((AVATAR_META[C.avatar] || {}).made || {}).hairColor; if (hc) C.hairColor = hc; }   // a built person brings the hair color it was made with
+    if (k === 'avatar') wearMade();   // a built person brings the hair color and the glasses it was made with
     charChanged();
   });
   $('#opts').querySelectorAll('input[type=color]').forEach(i => i.oninput = () => { C[i.dataset.k] = i.value; charChanged(); });
@@ -3791,6 +6024,11 @@ function buildOpts() {
 }
 
 /* ── 🧍 build a new realistic 3D person in Blender (MPFB / MakeHuman) ── */
+function wearMade() {
+  const md = (AVATAR_META[C.avatar] || {}).made || {};
+  if (md.hairColor) C.hairColor = md.hairColor;
+  if (md.glasses === 'frames' && !(C.acc || []).includes('glasses')) C.acc = [...(C.acc || []), 'glasses'];
+}
 let PB = null;   // {opts, person}
 function mountPersonBuilder(host) {
   const d = document.createElement('details'); d.className = 'pbuild';
@@ -3821,8 +6059,19 @@ function drawPersonBuilder(box) {
     + PB.opts.map(([k, label, spec]) => typeof spec[0] === 'number'
       ? `<div class="field"><label>${label}</label><input type="range" data-pk="${k}" min="${spec[0]}" max="${spec[1]}" step="${spec[2]}" value="${P[k]}"><output>${P[k]}</output></div>`
       : `<div class="opt"><b>${label}</b><div class="chips" data-pk="${k}">${spec.map(([v, l]) => `<button type="button" data-v="${v}" class="${P[k] === v ? 'on' : ''}"${v[0] === '#' ? ` style="border-left:14px solid ${v}"` : ''}>${l}</button>`).join('')}</div></div>`).join('')
+    + `<div class="opt"><b>Photo likeness</b><div class="pgo" style="margin-top:4px"><input type="file" id="pPhoto" accept="image/jpeg,image/png,image/webp">${P.photo ? `<span class="hint">✓ ${esc(P.photoName || 'Photo added')}</span><button type="button" id="pPhotoX">Remove</button>` : ''}<span id="pPhotoMsg" class="hint"></span></div>
+      <div class="hint">Optional. A front photo of a real face (looking at the camera, even light, mouth closed) is painted onto this person's skin; pick the closest skin tone above. Use your own face, or one you have permission for. Glasses on in the photo? Pick Black frames, so they are built in 3D instead of painted on. The photo stays on this Mac and the upload is deleted after the build.</div></div>`
     + `<div class="pgo"><button type="button" class="main" id="pBuild"${PB.blender ? '' : ' disabled'}>Build in Blender</button><span id="pMsg" class="hint"></span></div>
-    <div class="hint">Outfits keep their own colors. Glasses come from the toon options above, and the skin and hair swatches there can still recolor this person.</div>`;
+    <div class="hint">Frames built here switch on and off with Glasses in the toon options above, and the skin and hair swatches there can still recolor this person.</div>`;
+  box.querySelector('#pPhoto').onchange = async e => {
+    const f = e.target.files[0], msg = box.querySelector('#pPhotoMsg');
+    if (!f) return;
+    msg.className = 'hint'; msg.textContent = 'Adding…';
+    const fd = new FormData(); fd.append('image', f);
+    try { const r = await api('person_photo', fd); P.photo = r.photo; P.photoName = f.name; drawPersonBuilder(box); }
+    catch (err) { msg.className = 'err'; msg.textContent = err.message; }
+  };
+  const px = box.querySelector('#pPhotoX'); if (px) px.onclick = () => { P.photo = ''; P.photoName = ''; drawPersonBuilder(box); };
   box.querySelectorAll('.chips[data-pk] button').forEach(b => b.onclick = () => {
     const k = b.parentElement.dataset.pk; P[k] = b.dataset.v;
     if (k === 'body' && b.dataset.v === 'woman' && P.outfit.startsWith('male_')) { P.outfit = 'female_casualsuit01'; P.hair = 'ponytail01'; }
@@ -3843,7 +6092,7 @@ async function buildPerson(box) {
       const st = await api('person_status&id=' + id);
       msg.textContent = `${Math.round((st.progress || 0) * 100)}% · ${st.stage || ''}`;
       if (st.state === 'error') throw new Error(st.error);
-      if (st.state === 'done') { C.style = 'real'; C.avatar = st.avatar; C.hairColor = PB.person.hairColor || C.hairColor; await refreshPeople(); return; }
+      if (st.state === 'done') { C.style = 'real'; C.avatar = st.avatar; PB.person.photo = ''; PB.person.photoName = ''; await refreshPeople(); wearMade(); charChanged(); return; }
     }
   } catch (e) { msg.className = 'err'; msg.textContent = e.message; btn.disabled = false; }
 }
@@ -3861,7 +6110,7 @@ function syncOpts() {
   $('#opts').querySelectorAll('input[type=color]').forEach(i => { if (/^#[0-9a-f]{6}$/i.test(C[i.dataset.k])) i.value = C[i.dataset.k]; });
   $('#opts').querySelectorAll('input[type=range]').forEach(i => { i.value = C[i.dataset.k]; i.nextElementSibling.textContent = (+C[i.dataset.k]).toFixed(2); });
   $('#charName').value = C.name || '';
-  document.querySelectorAll('#opts .scgrid [data-f]').forEach(t => t.classList.toggle('on', C.bg === 'image' && C.bgImage === t.dataset.f));
+  document.querySelectorAll('#opts .scgrid [data-f]').forEach(t => t.classList.toggle('on', C.bg === 'image' && C.bgImage === t.dataset.f));   // pictures and clips
   // Realistic 3D: only show what changes a 3D person (their face, hair style and outfit come from the person itself)
   const real = C.style === 'real', made = !!(AVATAR_META[C.avatar] || {}).made;
   const cats = R3.av && R3.av.name === C.avatar ? new Set(R3.av.mats.map(m => m.userData.r3)) : null;   // the person's recolorable parts, once loaded
@@ -4028,8 +6277,9 @@ function drawBg(g, W, H, C, T) {
     const im = sceneImg(C.bgImage);
     g.fillStyle = '#1b1b22'; g.fillRect(0, 0, W, H);
     if (!im) return;
-    const z = 1.05 + 0.03 * Math.sin(T * 0.05), k = Math.max(W / im.naturalWidth, H / im.naturalHeight) * z, w = im.naturalWidth * k, h = im.naturalHeight * k;
-    g.drawImage(im, (W - w) / 2 + Math.sin(T * 0.037) * (w - W) * 0.35, (H - h) / 2 + Math.cos(T * 0.029) * (h - H) * 0.25, w, h);
+    const iw = im.naturalWidth || im.videoWidth, ih = im.naturalHeight || im.videoHeight, vid = im.tagName === 'VIDEO';   // a clip moves on its own: cover-fit, no drift
+    const z = vid ? 1 : 1.05 + 0.03 * Math.sin(T * 0.05), k = Math.max(W / iw, H / ih) * z, w = iw * k, h = ih * k;
+    g.drawImage(im, (W - w) / 2 + (vid ? 0 : Math.sin(T * 0.037) * (w - W) * 0.35), (H - h) / 2 + (vid ? 0 : Math.cos(T * 0.029) * (h - H) * 0.25), w, h);
     return;
   }
   if (C.bg === 'color') { g.fillStyle = col; g.fillRect(0, 0, W, H); return; }
@@ -5215,6 +7465,7 @@ function envAt(t) {
 const A = {file: null, job: '', name: '', buf: null, ana: null, sr: 0, mixEnv: null, beats: []};
 const P = {ctx: null, out: null, src: null, startAt: 0, offset: 0, playing: false};
 let REC = null, loadToken = 0, ENGINE_READY = false;
+const PAINTER_READY = <?= json_encode(painter_ready()) ?>, VIDEO_READY = <?= json_encode(video_ready()) ?>;   // the local extras (Showrunner → Engines)
 const CAMX = {   // 🎥 camera motion capture state (code further down)
   on: false, busy: false, stream: null, pose: null, face: null, lastVT: -1, lastTs: 0, rig: null, raw: null, fps: 0, nFr: 0, fpsT: 0,
   parts: new Set(['face', 'arms', 'body']), mouth: 'face', take: null, taking: null};
@@ -6019,12 +8270,32 @@ function mountScenes(host) {
   const box = document.createElement('div'); box.className = 'scenes';
   box.innerHTML = `<div class="scgrid"></div>
     <div class="row"><input type="text" class="scPrompt" placeholder="Describe a scene, e.g. rainy neon city street at night"><button type="button" class="shrink scGo">🎨 Make it</button></div>
-    <div class="row"><select class="scProv"><option value="hf">FLUX on Hugging Face (your HF login, best)</option><option value="free">Free, no account (lower quality, watermark)</option></select><button type="button" class="shrink scUp">⬆ Upload</button></div>
+    <div class="row"><select class="scProv"><option value="local">${PAINTER_READY ? '🖥 On this Mac: Z-Image Turbo (free, offline, ~1–2 min)' : '🖥 On this Mac (not installed yet: Showrunner → Engines)'}</option><option value="hf">FLUX on Hugging Face (your HF login)</option><option value="free">Free, no account (lower quality, watermark)</option></select><button type="button" class="shrink scUp">⬆ Upload</button></div>
     <input type="file" class="scFile" accept="image/jpeg,image/png,image/webp" hidden>
-    <div class="hint scMsg">Pictures made in ChatGPT work too: save one and upload it (or drop it here).</div>`;
+    <div class="hint scMsg">Pictures made in ChatGPT work too: save one and upload it (or drop it here).</div>
+    <div class="subhead">🎞 Clips (a moving background)</div>
+    <div class="scgrid clips"></div>
+    <div class="row"><button type="button" class="shrink scAnim" title="Turn the selected picture into a few seconds of video with Wan 2.2, and loop it behind the toon">🎞 Animate the selected picture</button><select class="scSecs"><option value="2">2 s</option><option value="3" selected>3 s</option><option value="4">4 s</option><option value="5">5 s</option></select></div>
+    <div class="hint scClipMsg">${VIDEO_READY ? 'Wan 2.2 runs on this Mac: a 3 s clip takes a few minutes. The clip loops behind the toon, and the voice plays over it.' : 'Video needs the Wan 2.2 engine: Showrunner → Engines → Install video.'}</div>`;
   host.appendChild(box);
   const q = c => box.querySelector(c), msg = (t, err) => { q('.scMsg').className = (err ? 'err' : 'hint') + ' scMsg'; q('.scMsg').textContent = t; };
-  try { q('.scProv').value = localStorage.toonSceneProv || 'hf'; } catch (e) {}
+  const cmsg = (t, err) => { q('.scClipMsg').className = (err ? 'err' : 'hint') + ' scClipMsg'; q('.scClipMsg').textContent = t; };
+  try { q('.scProv').value = localStorage.toonSceneProv || (PAINTER_READY ? 'local' : 'hf'); } catch (e) {}
+  if (!VIDEO_READY) q('.scAnim').disabled = true;
+  q('.scAnim').onclick = async () => {
+    const pic = C.bg === 'image' && /\.(jpe?g|png|webp)$/i.test(C.bgImage || '') ? C.bgImage : '';
+    if (!pic) { cmsg('Pick (or make) a picture first, then animate it.', true); return; }
+    const meta = (SCN.list || []).find(m => m.file === pic) || {};
+    q('.scAnim').disabled = true; cmsg('🎞 Starting Wan 2.2…');
+    try {
+      const fd = new FormData(); fd.append('image', pic); fd.append('prompt', q('.scPrompt').value.trim() || meta.prompt || ''); fd.append('seconds', q('.scSecs').value);
+      fd.append('aspect', (document.querySelector('#aspect button.on') || {}).dataset?.a || '16:9');
+      const r = await api('clip_gen', fd);
+      for (;;) { await sleep(1500); const st = await api('clip_status&id=' + r.id); cmsg('🎞 ' + (st.stage || 'Working…') + (st.progress ? ` · ${Math.round(st.progress * 100)}%` : '')); if (st.state === 'error') throw new Error(st.error || 'The clip failed.'); if (st.state === 'done') break; }
+      await loadClips(); use(r.file); cmsg('✓ The clip loops behind the toon now. Click a picture to go back to a still.');
+    } catch (e) { cmsg(e.message, true); }
+    q('.scAnim').disabled = false;
+  };
   q('.scProv').onchange = () => { try { localStorage.toonSceneProv = q('.scProv').value; } catch (e) {} };
   const use = f => { C.bg = 'image'; C.bgImage = f; charChanged(); };
   const upload = async file => {
@@ -6045,14 +8316,37 @@ function mountScenes(host) {
     try {
       const fd = new FormData(); fd.append('prompt', prompt); fd.append('style', C.style); fd.append('provider', q('.scProv').value);
       fd.append('aspect', (document.querySelector('#aspect button.on') || {}).dataset?.a || '16:9');
-      const r = await api('scene_gen', fd); await loadScenes(); use(r.file); msg(`✓ Made with ${r.source}. It matches the ${C.style} style; make it again for another take.`);
+      const r = await api('scene_gen', fd);
+      if (r.job) for (;;) { await sleep(1000); const st = await api('scene_status&id=' + r.job); msg('🎨 ' + (st.stage || 'Painting…')); if (st.state === 'error') throw new Error(st.error || 'Painting failed.'); if (st.state === 'done') break; }
+      await loadScenes(); use(r.file); msg(`✓ Made with ${r.source}. It matches the ${C.style} style; make it again for another take.`);
     } catch (e) { msg(e.message, true); }
     q('.scGo').disabled = false;
   };
   drawScenes();
   if (!SCN.list) loadScenes();
+  if (!SCN.clips) loadClips(); else drawClips();
 }
 async function loadScenes() { SCN.list = await api('scenes').catch(() => []); drawScenes(); }
+async function loadClips() { SCN.clips = await api('clips').catch(() => []); drawClips(); }
+function drawClips() {
+  const grid = document.querySelector('#opts .scgrid.clips');
+  if (!grid) return;
+  const L = SCN.clips || [];
+  grid.innerHTML = L.length ? L.map(m => `<div class="scthumb${C.bg === 'image' && C.bgImage === m.file ? ' on' : ''}" data-f="${esc(m.file)}" title="${esc(m.prompt || m.title)} · ${m.seconds || ''}s">
+      <video muted loop playsinline preload="metadata" src="clips/${encodeURIComponent(m.file)}"></video><button type="button" class="scdel" title="Delete this clip">✕</button></div>`).join('')
+    : '<div class="hint">No clips yet. Pick a picture and 🎞 Animate it.</div>';
+  grid.querySelectorAll('.scthumb').forEach(t => {
+    const v = t.querySelector('video'); if (v) { t.onmouseenter = () => v.play().catch(() => {}); t.onmouseleave = () => { v.pause(); v.currentTime = 0; }; }
+    t.onclick = async e => {
+      if (e.target.classList.contains('scdel')) {
+        const fd = new FormData(); fd.append('kind', 'clip'); fd.append('file', t.dataset.f);
+        try { await api('media_delete', fd); if (C.bgImage === t.dataset.f) { C.bgImage = ''; if (C.bg === 'image') C.bg = 'stage'; charChanged(); } await loadClips(); } catch (err) { alertMsg(err.message); }
+        return;
+      }
+      C.bg = 'image'; C.bgImage = t.dataset.f; charChanged();
+    };
+  });
+}
 function drawScenes() {
   const grid = document.querySelector('#opts .scgrid');
   if (!grid) return;
@@ -7426,6 +9720,11 @@ $('#gDirBtn').onclick = async () => {
   try {
     const fd = new FormData(); fd.append('prompt', prompt); fd.append('model', $('#gModel').value);
     const {plan} = await api('game_director', fd); await voxReady();
+    $('#gDirInfo').textContent = applyPlan(plan);
+  } catch (e) { $('#gDirErr').textContent = e.message; $('#gDirErr').hidden = false; $('#gDirInfo').textContent = ''; }
+  btn.disabled = false;
+};
+function applyPlan(plan) {   // the Director's plan → the editor spec (also used by headless builds: ?a=game_make with a prompt)
     const s = GS.spec, bgs = BG_ROW.map(b => b[0]).filter(b => b !== 'image');
     const firstOf = (v, list) => String(v || '').toLowerCase().split(/[^a-z]+/).find(x => list.includes(x));   // small models answer "topdown|shooter"
     plan.mold = firstOf(plan.mold, Object.keys(TG.MOLDS)); plan.sfx = firstOf(plan.sfx, TG.SFX.styles);
@@ -7446,16 +9745,707 @@ $('#gDirBtn').onclick = async () => {
     if (TG.SFX.styles.includes(plan.sfx)) s.audio.sfxStyle = plan.sfx;
     if (plan.music && typeof plan.music === 'string') $('#aCompPrompt').value = plan.music;
     GS.sel = 0; changed(); renderAll();
-    $('#gDirInfo').textContent = `✓ "${s.title}" — ${TG.MOLDS[s.mold].name}, ${s.levels.length} stage${s.levels.length > 1 ? 's' : ''}, ${s.cast.enemies.length} enem${s.cast.enemies.length === 1 ? 'y' : 'ies'}${s.cast.boss ? ' and a boss' : ''}. ▶ Play it, or tweak anything first.` + (plan.music ? ' A music idea is waiting under Audio → 🎼 Compose.' : '');
-  } catch (e) { $('#gDirErr').textContent = e.message; $('#gDirErr').hidden = false; $('#gDirInfo').textContent = ''; }
-  btn.disabled = false;
-};
+    return `✓ "${s.title}" — ${TG.MOLDS[s.mold].name}, ${s.levels.length} stage${s.levels.length > 1 ? 's' : ''}, ${s.cast.enemies.length} enem${s.cast.enemies.length === 1 ? 'y' : 'ies'}${s.cast.boss ? ' and a boss' : ''}. ▶ Play it, or tweak anything first.` + (plan.music ? ' A music idea is waiting under Audio → 🎼 Compose.' : '');
+}
+
+/* ── build mode: ?p=game&build=<id> — headless Chrome opens this for ?a=game_make and the CLI; the page builds, saves, and reports back ── */
+const BUILD_ID = new URLSearchParams(location.search).get('build');
+async function runBuild() {
+  try {
+    const b = await api('game_build_get&id=' + BUILD_ID);
+    await voxReady(); await document.fonts.ready;
+    if (b.plan) { GS.spec = defaultSpec(); applyPlan(b.plan); } else GS.spec = normSpec(b.spec);
+    const v = GS.spec.audio.voice;
+    if (b.voice) { if (typeof b.voice.saved_voice === 'string') v.saved_voice = b.voice.saved_voice; if (b.voice.tts_voice) v.tts_voice = b.voice.tts_voice; for (const k of ['start', 'win', 'lose', 'hurt']) if (b.voice.lines && typeof b.voice.lines[k] === 'string') v.lines[k] = b.voice.lines[k]; }
+    Object.assign(v.files, b.voice_files || {});
+    if (b.music_file && b.music_ok !== false) GS.spec.audio.music.file = b.music_file;
+    GS.gameId = ''; GS.sel = 0; renderAll();
+    const cfg = await buildConfig(); const html = cartridge(cfg), thumb = await makeThumb(cfg);
+    const fd = new FormData(); fd.append('id', ''); fd.append('spec', JSON.stringify(GS.spec)); fd.append('html', html); fd.append('thumb', thumb); fd.append('build', BUILD_ID);
+    const r = await api('game_save', fd); GS.gameId = r.id; lastHTML = html;
+    msg(`✓ Built "${cfg.spec.title}" (${r.id}) for the agent that asked.`);
+  } catch (e) { console.error(e); const fd = new FormData(); fd.append('id', BUILD_ID); fd.append('error', e.message || String(e)); api('game_build_report', fd).catch(() => {}); }
+}
 
 /* ── boot ── */
 function renderAll() { renderGame(); renderCast(); renderLevels(); renderRules(); renderAudio(); }
 (async () => {
   [GS.scenes, GS.music, GS.voices] = await Promise.all([api('scenes').catch(() => []), api('music').then(r => r.tracks || []).catch(() => []), api('voices').catch(() => [])]);
   renderAll(); loadGallery(); loadModels(); initBuddies();
+  if (BUILD_ID) runBuild();
+})();
+</script>
+<?php endif; ?>
+<?php if ($page === 'show'): ?>
+<main class="toon show">
+  <div class="side">
+    <details class="panel fold" data-fold="ep" open>
+      <summary><h2><span class="step">1</span> Episode</h2></summary>
+      <input type="text" id="epTitle" placeholder="Episode title, e.g. Local AI News · Ep. 1" maxlength="80">
+      <div class="opt"><b>Frame</b><div class="chips" id="epAspect"><button type="button" data-a="16:9" class="on">16:9 YouTube</button><button type="button" data-a="9:16">9:16 Shorts</button><button type="button" data-a="1:1">1:1</button></div></div>
+      <div class="opt"><b>Between scenes</b><div class="chips" id="epTrans"><button type="button" data-v="fade" class="on">Crossfade</button><button type="button" data-v="cut">Hard cut</button></div></div>
+      <div class="opt"><b>Music under the whole episode</b>
+        <div class="row"><select id="epMusic"><option value="">No music</option></select></div>
+        <div class="row"><input type="text" id="epMusicPrompt" placeholder="…or compose one: e.g. warm lo-fi beat, soft piano"><span class="meta shrink">MusicGen</span></div>
+        <div class="field"><label>Volume</label><input type="range" id="epMusicVol" min="0" max="0.5" step="0.01" value="0.12"><output></output></div>
+      </div>
+      <div class="hint">An episode is a list of scenes rendered one after another and joined into one MP4: title cards, toons talking (each one is a full Toon Lab render), and B-roll clips.</div>
+    </details>
+
+    <details class="panel fold" data-fold="epdir" open>
+      <summary><h2><span class="step">2</span> ✨ Director</h2></summary>
+      <textarea id="epDirPrompt" rows="2" placeholder="e.g. a 4-scene episode where a hacker and a news anchor argue about whether local AI models are good enough"></textarea>
+      <div class="row"><select id="epModel" title="Which local model writes it"></select><button type="button" class="shrink" id="epModelRefresh" title="Reload the model list">↻</button><button type="button" class="shrink" id="epDirBtn">✨ Write the episode</button></div>
+      <div class="hint" id="epDirInfo">Your local model (Ollama) writes the title card, the scenes and the scripts. Then change anything below.</div>
+      <div class="err" id="epDirErr" hidden></div>
+    </details>
+
+    <details class="panel fold" data-fold="epscenes" open>
+      <summary><h2><span class="step">3</span> Scenes <span class="meta" id="epCount"></span></h2></summary>
+      <div id="epScenes"></div>
+      <div class="row" style="margin-top:10px"><button type="button" class="shrink" data-add="title">+ Title card</button><button type="button" class="shrink" data-add="talk">+ Toon talking</button><button type="button" class="shrink" data-add="clip" id="addClip">+ B-roll clip</button></div>
+      <div class="hint">Drag nothing: use ▲ ▼ to reorder. A talk scene is a whole Toon Lab render (about 1–2 min each). B-roll needs the Wan 2.2 video engine (see Engines on the right).</div>
+    </details>
+
+    <section class="panel">
+      <h2><span class="step">4</span> Make it</h2>
+      <button class="big" id="epMake" type="button">🎬 Make the episode</button>
+      <div class="hint" id="epEst"></div>
+      <div id="epProg" hidden><div class="bar"><i></i></div><div class="meta" id="epStage"></div><div class="ep-scenes" id="epSceneStates"></div></div>
+      <div class="err" id="epErr" hidden></div>
+      <div class="hint" id="epDone" hidden></div>
+    </section>
+  </div>
+
+  <div class="stagecol">
+    <section class="panel">
+      <video id="showPlayer" controls playsinline hidden></video>
+      <div class="empty" id="showEmpty">Finished episodes play here. Build one on the left, or ▶ one below.</div>
+      <h2 style="margin-top:14px">🎞 Episodes <span class="meta" id="epGalCount"></span></h2>
+      <div class="gallery" id="epGallery"></div>
+    </section>
+
+    <section class="panel">
+      <h2>🧰 Jobs <span class="meta">everything this Mac is working on</span></h2>
+      <div id="jobsAll"><div class="hint">Loading…</div></div>
+    </section>
+
+    <section class="panel">
+      <h2>⚙ Engines <span class="meta">what's installed on this Mac</span></h2>
+      <div id="engines"><div class="hint">Loading…</div></div>
+    </section>
+
+    <section class="panel">
+      <h2>🐍 Recipes <span class="meta">Python scripts that drive the app · recipes/</span></h2>
+      <div id="recipes"><div class="hint">Loading…</div></div>
+      <div class="hint">Each recipe is a plain Python file you can read, copy and change. They talk to this app through <code>tools/toonhouse.py</code>, so the same thing happens every time you run them. Run one here, or from a terminal.</div>
+    </section>
+  </div>
+</main>
+<script>
+const PRESETS = <?= json_encode(toon_presets(), JSON_UNESCAPED_UNICODE) ?>, STYLES = <?= json_encode(array_column(TOON_SCHEMA[1][2], 0)) ?>, TTS_OPTS = <?= json_encode(tts_voice_options()) ?>;
+const PAINTER_READY = <?= json_encode(painter_ready()) ?>, VIDEO_READY = <?= json_encode(video_ready()) ?>;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const LIB = {chars: [], voices: [], scenes: [], music: [], clips: []};
+let EP = {title: '', aspect: '16:9', transition: 'fade', bgm: {file: '', prompt: '', volume: 0.12}, scenes: []};
+try { const d = JSON.parse(localStorage.showDraft || 'null'); if (d && d.scenes) EP = d; } catch (e) {}
+const save = () => { try { localStorage.showDraft = JSON.stringify(EP); } catch (e) {} };
+const newScene = kind => kind === 'title' ? {kind, text: EP.title || 'EPISODE ONE', sub: '', seconds: 3, color: '#111118', textColor: '#ffd23f'}
+  : kind === 'clip' ? {kind, prompt: '', image: '', seconds: 3}
+  : {kind: 'talk', who: 'anchor', style: '', name: '', script: '', scene: '', sceneFile: '', voice: '', tts_voice: 'am_michael', camera: 'medium', subtitles: 'karaoke', lower: true};
+const words = t => (t.trim().match(/\S+/g) || []).length;
+function estimate() {
+  let secs = 0, talks = 0, clips = 0;
+  for (const sc of EP.scenes) { if (sc.kind === 'title') secs += +sc.seconds || 3; else if (sc.kind === 'clip') { secs += +sc.seconds || 3; clips++; } else { secs += words(sc.script || '') / 2.6 + 1; talks++; } }
+  $('#epEst').textContent = EP.scenes.length ? `About ${Math.round(secs)} s of video · ${talks} talk scene${talks === 1 ? '' : 's'} (≈${talks * 1.5 | 0}–${talks * 2.5 | 0} min to render)${clips ? ` · ${clips} B-roll clip${clips === 1 ? '' : 's'} (a few minutes each)` : ''}.` : 'Add a scene or let the Director write some.';
+  $('#epCount').textContent = EP.scenes.length ? `· ${EP.scenes.length}` : '';
+}
+function syncHeader() {
+  $('#epTitle').value = EP.title || '';
+  document.querySelectorAll('#epAspect button').forEach(b => b.classList.toggle('on', b.dataset.a === EP.aspect));
+  document.querySelectorAll('#epTrans button').forEach(b => b.classList.toggle('on', b.dataset.v === EP.transition));
+  const sel = $('#epMusic'); sel.innerHTML = '<option value="">No music</option>' + LIB.music.map(m => `<option value="${esc(m.file)}">🎵 ${esc(m.title)}</option>`).join('');
+  sel.value = EP.bgm && EP.bgm.file && LIB.music.some(m => m.file === EP.bgm.file) ? EP.bgm.file : '';
+  $('#epMusicPrompt').value = EP.bgm ? EP.bgm.prompt || '' : ''; $('#epMusicVol').value = EP.bgm ? EP.bgm.volume ?? 0.12 : 0.12; $('#epMusicVol').dispatchEvent(new Event('input'));
+}
+$('#epTitle').oninput = () => { EP.title = $('#epTitle').value; save(); };
+document.querySelectorAll('#epAspect button').forEach(b => b.onclick = () => { EP.aspect = b.dataset.a; save(); syncHeader(); });
+document.querySelectorAll('#epTrans button').forEach(b => b.onclick = () => { EP.transition = b.dataset.v; save(); syncHeader(); });
+$('#epMusic').onchange = () => { EP.bgm = {...(EP.bgm || {}), file: $('#epMusic').value}; save(); };
+$('#epMusicPrompt').oninput = () => { EP.bgm = {...(EP.bgm || {}), prompt: $('#epMusicPrompt').value}; save(); };
+$('#epMusicVol').oninput = () => { EP.bgm = {...(EP.bgm || {}), volume: +$('#epMusicVol').value}; save(); };
+document.querySelectorAll('.field input[type=range]').forEach(r => { const o = r.parentElement.querySelector('output'); const f = () => { if (o) o.textContent = r.value; }; r.addEventListener('input', f); f(); });
+
+const opt = (list, cur, label = x => x) => list.map(x => `<option value="${esc(x)}"${x === cur ? ' selected' : ''}>${esc(label(x))}</option>`).join('');
+function whoOptions(cur) {
+  let h = '<optgroup label="Presets">' + Object.entries(PRESETS).map(([k, p]) => `<option value="${k}"${k === cur ? ' selected' : ''}>${esc(p.name || k)} · ${k}</option>`).join('') + '</optgroup>';
+  if (LIB.chars.length) h += '<optgroup label="Saved toons">' + LIB.chars.map(c => `<option value="saved:${esc(c.name)}"${'saved:' + c.name === cur ? ' selected' : ''}>⭐ ${esc(c.name)}</option>`).join('') + '</optgroup>';
+  if (cur === 'custom') h += `<option value="custom" selected>✎ this scene's own character</option>`;
+  return h;
+}
+function renderScenes() {
+  const host = $('#epScenes');
+  host.innerHTML = EP.scenes.length ? '' : '<div class="hint">No scenes yet. Add one below, or ask the Director.</div>';
+  EP.scenes.forEach((sc, i) => {
+    const card = document.createElement('div'); card.className = 'sc-card';
+    const head = `<div class="sc-head"><span class="kind ${sc.kind}">${{title: '🏷 Title', talk: '🗣 Talk', clip: '🎞 B-roll'}[sc.kind]}</span><b>${esc(sc.kind === 'talk' ? (sc.name || (PRESETS[sc.who] || {}).name || 'Toon') : sc.kind === 'title' ? (sc.text || 'Title') : (sc.prompt || 'Clip'))}</b>
+      <button type="button" data-up title="Move up">▲</button><button type="button" data-down title="Move down">▼</button><button type="button" data-del title="Remove">✕</button></div>`;
+    if (sc.kind === 'title') card.innerHTML = head + `<div class="row"><input type="text" data-k="text" value="${esc(sc.text || '')}" placeholder="BIG TITLE" maxlength="60"></div>
+      <div class="row"><input type="text" data-k="sub" value="${esc(sc.sub || '')}" placeholder="a subtitle (optional)" maxlength="80"></div>
+      <div class="row"><label class="lbl shrink">Seconds</label><select data-k="seconds">${opt(['2', '3', '4', '5', '6'], String(sc.seconds || 3))}</select><label class="lbl shrink">Colors</label><input type="color" data-k="color" value="${sc.color || '#111118'}"><input type="color" data-k="textColor" value="${sc.textColor || '#ffd23f'}"></div>`;
+    else if (sc.kind === 'clip') card.innerHTML = head + `<div class="row"><input type="text" data-k="prompt" value="${esc(sc.prompt || '')}" placeholder="what moves: e.g. slow camera drift through a server room, lights blinking"></div>
+      <div class="two"><select data-k="image"><option value="">Start from a fresh picture (text only)</option>${LIB.scenes.map(m => `<option value="${esc(m.file)}"${m.file === sc.image ? ' selected' : ''}>🖼 ${esc(m.title)}</option>`).join('')}</select><select data-k="seconds">${opt(['2', '3', '4', '5'], String(sc.seconds || 3), x => x + ' s')}</select></div>
+      ${VIDEO_READY ? '' : '<div class="err">The video engine (Wan 2.2) is not installed: this scene will fail. Install it under ⚙ Engines, or remove the scene.</div>'}`;
+    else {
+      const preset = PRESETS[sc.who] || {};
+      card.innerHTML = head + `<div class="two"><select data-k="who">${whoOptions(sc.who)}</select><select data-k="style"><option value="">Style: as the preset</option>${opt(STYLES.filter(x => x !== 'real'), sc.style || '')}</select></div>
+      <div class="row"><input type="text" data-k="name" value="${esc(sc.name || '')}" placeholder="Name on screen (default: ${esc(preset.name || 'the toon')})" maxlength="40"></div>
+      <textarea data-k="script" placeholder="What they say. About 2.6 words per second: 60–150 words is 25–60 s.">${esc(sc.script || '')}</textarea>
+      <div class="meta">${words(sc.script || '')} words ≈ ${Math.round(words(sc.script || '') / 2.6)} s</div>
+      <div class="row"><input type="text" data-k="scene" value="${esc(sc.scene || '')}" placeholder="Picture behind them: describe a place (painted by ${PAINTER_READY ? 'Z-Image on this Mac' : 'FLUX'}), or pick one →"><select data-k="sceneFile" class="shrink" style="max-width:150px"><option value="">(paint it)</option>${LIB.scenes.map(m => `<option value="${esc(m.file)}"${m.file === sc.sceneFile ? ' selected' : ''}>🖼 ${esc(m.title)}</option>`).join('')}${LIB.clips.map(m => `<option value="${esc(m.file)}"${m.file === sc.sceneFile ? ' selected' : ''}>🎞 ${esc(m.title)}</option>`).join('')}</select></div>
+      <div class="two"><select data-k="voice"><option value="">🤖 AI voice only</option>${LIB.voices.map(v => `<option value="${esc(v.name)}"${v.name === sc.voice ? ' selected' : ''}>🎙 My voice: ${esc(v.name)}</option>`).join('')}</select><select data-k="tts_voice">${TTS_OPTS}</select></div>
+      <div class="two"><select data-k="camera">${opt(['full', 'medium', 'close'], sc.camera || 'medium', x => 'Camera: ' + x)}</select><select data-k="subtitles">${opt(['karaoke', 'subtitle', 'pop', 'off'], sc.subtitles || 'karaoke', x => 'Subtitles: ' + x)}</select></div>
+      <label class="check"><input type="checkbox" data-k="lower"${sc.lower !== false ? ' checked' : ''}><span>Lower-third with the name</span></label>`;
+      card.querySelector('[data-k=tts_voice]').value = sc.tts_voice || 'am_michael';
+    }
+    card.querySelectorAll('[data-k]').forEach(el => el.addEventListener(el.tagName === 'TEXTAREA' || el.type === 'text' ? 'input' : 'change', () => {
+      sc[el.dataset.k] = el.type === 'checkbox' ? el.checked : el.dataset.k === 'seconds' ? +el.value : el.value;
+      if (el.dataset.k === 'who' && el.value !== 'custom') delete sc.character;
+      save(); estimate();
+      if (el.tagName === 'TEXTAREA') card.querySelector('.meta').textContent = `${words(sc.script || '')} words ≈ ${Math.round(words(sc.script || '') / 2.6)} s`;
+      else if (el.dataset.k === 'who' || el.dataset.k === 'name' || el.dataset.k === 'text' || el.dataset.k === 'prompt') card.querySelector('.sc-head b').textContent = sc.kind === 'talk' ? (sc.name || (PRESETS[sc.who] || {}).name || 'Toon') : sc.kind === 'title' ? (sc.text || 'Title') : (sc.prompt || 'Clip');
+    }));
+    card.querySelector('[data-up]').onclick = () => { if (i > 0) { [EP.scenes[i - 1], EP.scenes[i]] = [EP.scenes[i], EP.scenes[i - 1]]; save(); renderScenes(); } };
+    card.querySelector('[data-down]').onclick = () => { if (i < EP.scenes.length - 1) { [EP.scenes[i + 1], EP.scenes[i]] = [EP.scenes[i], EP.scenes[i + 1]]; save(); renderScenes(); } };
+    card.querySelector('[data-del]').onclick = () => { EP.scenes.splice(i, 1); save(); renderScenes(); };
+    host.appendChild(card);
+  });
+  estimate();
+}
+document.querySelectorAll('[data-add]').forEach(b => b.onclick = () => { EP.scenes.push(newScene(b.dataset.add)); save(); renderScenes(); $('#epScenes').lastElementChild.scrollIntoView({behavior: 'smooth', block: 'nearest'}); });
+
+/* the editor's scenes → the episode JSON the server (and tools/toonhouse.py) understands */
+function toEpisode() {
+  const scenes = EP.scenes.map(sc => {
+    if (sc.kind === 'title') return {kind: 'title', text: sc.text, sub: sc.sub, seconds: +sc.seconds || 3, color: sc.color, textColor: sc.textColor};
+    if (sc.kind === 'clip') return {kind: 'clip', prompt: sc.prompt, image: sc.image || '', seconds: +sc.seconds || 3};
+    const t = {kind: 'talk', script: sc.script || '', voice: sc.voice || '', tts_voice: sc.tts_voice || 'am_michael', subtitles: {style: sc.subtitles || 'karaoke'}, motion: {camera: sc.camera || 'medium'}, captions: []};
+    if (sc.who === 'custom' && sc.character) t.character = sc.character;
+    else if (String(sc.who || '').startsWith('saved:')) { const c = LIB.chars.find(c => c.name === sc.who.slice(6)); if (c) { t.character = {...c}; delete t.character.file; } }
+    else t.preset = sc.who || 'anchor';
+    if (sc.style) t.style = sc.style;
+    const name = sc.name || (t.character && t.character.name) || (PRESETS[sc.who] || {}).name || '';
+    if (sc.name) t.character = {...(t.character || {}), name: sc.name};
+    if (sc.sceneFile) t.scene = /\.mp4$/i.test(sc.sceneFile) ? {clip: sc.sceneFile} : {file: 'scenes/' + sc.sceneFile};
+    else if (sc.scene) t.scene = sc.scene;
+    if (sc.lower !== false && name) t.captions.push({kind: 'lower', text: name, start: 0.6, end: 5});
+    return t;
+  });
+  const ep = {title: EP.title || 'Episode', aspect: EP.aspect, transition: EP.transition, scenes};
+  if (EP.bgm && (EP.bgm.file || (EP.bgm.prompt || '').trim())) ep.bgm = {file: EP.bgm.file || '', prompt: (EP.bgm.prompt || '').trim(), volume: +EP.bgm.volume || 0.12};
+  return ep;
+}
+/* an episode JSON (from the Director, or a saved one) → editor scenes */
+function fromEpisode(ep) {
+  EP = {title: ep.title || '', aspect: ep.aspect || '16:9', transition: ep.transition || 'fade', bgm: ep.bgm ? {file: ep.bgm.file || '', prompt: ep.bgm.prompt || '', volume: ep.bgm.volume ?? 0.12} : {file: '', prompt: '', volume: 0.12}, scenes: []};
+  for (const sc of ep.scenes || []) {
+    if (sc.kind === 'title') EP.scenes.push({...newScene('title'), ...sc});
+    else if (sc.kind === 'clip') EP.scenes.push({...newScene('clip'), ...sc});
+    else {
+      const t = newScene('talk');
+      t.who = sc.preset && PRESETS[sc.preset] ? sc.preset : sc.character && sc.character.name && LIB.chars.some(c => c.name === sc.character.name) ? 'saved:' + sc.character.name : sc.character ? 'custom' : 'anchor';
+      if (t.who === 'custom') t.character = sc.character;
+      t.style = sc.style || (sc.character && sc.character.style) || ''; t.name = (sc.character && sc.character.name) || sc.name || ''; t.script = sc.script || '';
+      if (typeof sc.scene === 'string') t.scene = sc.scene; else if (sc.scene && sc.scene.file) t.sceneFile = String(sc.scene.file).split('/').pop(); else if (sc.scene && sc.scene.clip) t.sceneFile = sc.scene.clip; else if (sc.scene && sc.scene.prompt) t.scene = sc.scene.prompt;
+      t.voice = sc.voice || ''; t.tts_voice = sc.tts_voice || 'am_michael'; t.camera = (sc.motion || {}).camera || 'medium'; t.subtitles = (sc.subtitles || {}).style || 'karaoke';
+      t.lower = !!(sc.captions || []).some(c => c.kind === 'lower') || !sc.captions;
+      EP.scenes.push(t);
+    }
+  }
+  save(); syncHeader(); renderScenes();
+}
+
+/* ✨ Director */
+async function loadModels() {
+  const sel = $('#epModel'); sel.innerHTML = '<option value="">loading models…</option>';
+  try { const r = await api('llm_models'); sel.innerHTML = r.models.length ? r.models.map(m => `<option value="${esc(m.id)}">🧠 ${esc(m.id)}${m.size ? ' · ' + esc(m.size) : ''}</option>`).join('') : '<option value="">no text models yet — run: ollama pull qwen3.5:2b</option>'; if (r.models.some(m => m.id === r.llm_model)) sel.value = r.llm_model; }
+  catch (e) { sel.innerHTML = '<option value="">⚠ model server not reachable</option>'; }
+}
+$('#epModelRefresh').onclick = loadModels;
+$('#epModel').onchange = () => { const fd = new FormData(); fd.append('llm_model', $('#epModel').value); api('settings', fd).catch(() => {}); };
+$('#epDirBtn').onclick = async () => {
+  const prompt = $('#epDirPrompt').value.trim(); if (!prompt) { $('#epDirPrompt').focus(); return; }
+  $('#epDirBtn').disabled = true; $('#epDirErr').hidden = true; $('#epDirInfo').textContent = `${$('#epModel').value || 'Your local model'} is writing the episode… (a minute for big models)`;
+  try {
+    const fd = new FormData(); fd.append('prompt', prompt); fd.append('model', $('#epModel').value);
+    const {episode} = await api('show_director', fd); fromEpisode(episode);
+    $('#epDirInfo').textContent = `✓ "${episode.title}": ${episode.scenes.length} scenes. Read the scripts, change anything, then 🎬 Make the episode.`;
+  } catch (e) { $('#epDirErr').textContent = e.message; $('#epDirErr').hidden = false; $('#epDirInfo').textContent = ''; }
+  $('#epDirBtn').disabled = false;
+};
+
+/* 🎬 make */
+let MAKING = null;
+$('#epMake').onclick = async () => {
+  if (!EP.scenes.length) { $('#epErr').textContent = 'Add at least one scene first.'; $('#epErr').hidden = false; return; }
+  if (EP.scenes.some(sc => sc.kind === 'talk' && !(sc.script || '').trim())) { $('#epErr').textContent = 'Every talk scene needs a script.'; $('#epErr').hidden = false; return; }
+  $('#epErr').hidden = true; $('#epDone').hidden = true; $('#epMake').disabled = true; $('#epProg').hidden = false; $('#epProg i').style.width = '1%'; $('#epStage').textContent = 'Starting…';
+  try {
+    const r = await api('show_make', JSON.stringify(toEpisode())); MAKING = r.id;
+    for (;;) {
+      await sleep(2000);
+      const st = await api('show_status&id=' + r.id);
+      $('#epProg i').style.width = Math.round((st.progress || 0) * 100) + '%'; $('#epStage').textContent = st.stage || '';
+      $('#epSceneStates').innerHTML = (st.scenes || []).map((x, i) => `<div><span class="state ${x.state === 'done' ? 'done' : x.state === 'error' ? 'error' : ''}">${x.state === 'done' ? '✓' : x.state === 'running' ? Math.round((x.progress || 0) * 100) + '%' : '·'}</span><span class="kind ${x.kind}">${x.kind}</span><span class="t">${i + 1}. ${esc(x.stage || '')}</span></div>`).join('');
+      if (st.state === 'error') throw new Error(st.error || 'The episode failed.');
+      if (st.state === 'done') { $('#epDone').innerHTML = `✓ Done: <b>${esc(st.render || '')}</b> (${st.duration || '?'} s). It's in the gallery here and in Toon Lab's gallery too.`; $('#epDone').hidden = false; await loadGallery(r.id); playRender(st.render); break; }
+    }
+  } catch (e) { $('#epErr').textContent = e.message; $('#epErr').hidden = false; }
+  MAKING = null; $('#epMake').disabled = false; loadJobs();
+};
+
+/* gallery + player */
+function playRender(f) { if (!f) return; const v = $('#showPlayer'); v.hidden = false; $('#showEmpty').hidden = true; v.src = '?a=render&f=' + encodeURIComponent(f); v.play().catch(() => {}); v.scrollIntoView({behavior: 'smooth', block: 'nearest'}); }
+async function loadGallery(flash) {
+  const list = await api('shows').catch(() => []);
+  $('#epGalCount').textContent = list.length ? `· ${list.length}` : '';
+  $('#epGallery').innerHTML = list.length ? list.map(g => `<div class="gcard${g.id === flash ? ' flash' : ''}"><div class="gthumb" style="${g.render ? `background-image:url('?a=render_thumb&f=${encodeURIComponent(g.render)}')` : ''}"><span>${g.state === 'done' ? g.aspect : esc(g.state === 'error' ? 'failed' : (g.stage || g.state))}</span></div>
+      <div class="gt">${esc(g.title)}</div><div class="meta">${g.scenes} scene${g.scenes === 1 ? '' : 's'} · ${new Date(g.time * 1000).toLocaleDateString([], {month: 'short', day: 'numeric'})}${g.state !== 'done' ? ' · ' + Math.round((g.progress || 0) * 100) + '%' : ''}</div>
+      <div class="gacts">${g.render ? `<button type="button" data-play="${esc(g.render)}">▶ Play</button><a href="?a=render&f=${encodeURIComponent(g.render)}&dl=1" title="Download">⬇</a>` : ''}<button type="button" data-remix="${g.id}" title="Load into the editor">✎ Remix</button><button type="button" data-del="${g.id}" title="Delete">🗑</button></div></div>`).join('')
+    : '<div class="empty">No episodes yet. Build one on the left.</div>';
+  $('#epGallery').querySelectorAll('[data-play]').forEach(b => b.onclick = () => playRender(b.dataset.play));
+  $('#epGallery').querySelectorAll('[data-remix]').forEach(b => b.onclick = async () => { try { fromEpisode(await api('show_get&id=' + b.dataset.remix)); window.scrollTo({top: 0, behavior: 'smooth'}); } catch (e) { alert(e.message); } });
+  $('#epGallery').querySelectorAll('[data-del]').forEach(b => b.onclick = async () => { if (b.dataset.armed !== '1') { b.dataset.armed = '1'; b.textContent = 'Sure?'; setTimeout(() => { b.dataset.armed = ''; b.textContent = '🗑'; }, 3000); return; } const fd = new FormData(); fd.append('id', b.dataset.del); await api('show_delete', fd).catch(() => {}); loadGallery(); });
+}
+
+/* 🧰 jobs */
+const KIND = {song: '🎤 song', speech: '📝 speech', line: '🗣 line', render: '🎬 render', music: '🎼 music', scene: '🎨 picture', clip: '🎞 clip', person: '🧍 person', game: '🕹 game', show: '🎞 episode'};
+async function loadJobs() {
+  const list = await api('jobs_all').catch(() => null);
+  if (!list) return;
+  $('#jobsAll').innerHTML = list.length ? list.slice(0, 30).map(j => `<div class="jobrow"><span class="kind ${j.kind}">${KIND[j.kind] || j.kind}</span><div><div class="t" title="${esc(j.title)}">${esc(j.title || j.id)} <span class="meta">${esc(j.stage || '')}</span></div>${['queued', 'running'].includes(j.state) ? `<div class="bar"><i style="width:${Math.round((j.progress || 0) * 100)}%"></i></div>` : ''}</div>
+      <span class="state ${j.state === 'done' ? 'done' : j.state === 'error' ? 'error' : ''}" title="${esc(j.error || '')}">${j.state}</span></div>`).join('') : '<div class="hint">Nothing yet. Every voice swap, render, picture, clip, game and episode shows up here.</div>';
+  const busy = list.some(j => ['queued', 'running'].includes(j.state));
+  clearTimeout(loadJobs.t); loadJobs.t = setTimeout(loadJobs, busy ? 2500 : 10000);
+}
+
+/* ⚙ engines */
+async function loadEngines() {
+  const [eng, ex, llm, ckpt] = await Promise.all([api('engine').catch(() => ({})), api('extras').catch(() => ({})), api('llm_models').catch(() => ({models: []})), Promise.resolve(null)]);
+  const ok = (b, yes = 'installed', no = 'not installed') => b ? `<span class="ok">✓ ${yes}</span>` : `<span class="no">○ ${no}</span>`;
+  const speech = (TTS_OPTS.match(/<optgroup label="Ollama/g) || []).length;
+  const row = (name, status, body = '', act = '') => `<div class="engrow"><div><b>${name}</b> · ${status}${body ? `<div class="hint" style="margin:2px 0 0">${body}</div>` : ''}</div><div>${act}</div></div>`;
+  const inst = (what, st, label) => st.installing ? `<span class="meta">installing…</span>` : st.ready ? '' : `<button type="button" data-install="${what}">⬇ ${label}</button>`;
+  const logbox = st => st.installing || (!st.ready && st.log) ? `<pre>${esc(st.log || '')}</pre>` : '';
+  $('#engines').innerHTML =
+    row('Engine', ok(eng.ready, 'Seed-VC, Demucs, Kokoro, wav2vec2', 'not installed yet'), eng.ready ? 'Voice conversion, text to speech, lip-sync. The base of everything.' : 'Install it on the Voice Swap page (one time, ~3 GB).') +
+    row('Renderer', ok(!!eng.chrome, 'headless ' + String(eng.chrome || '').split('/').filter(x => /\.app$/.test(x)).join('').replace('.app', '') || 'headless Chrome', 'no Chrome found'), eng.chrome ? 'Records Toon Lab videos, builds games and renders episodes in the background.' : 'Install Google Chrome, Chromium, Brave or Edge: a browser records the videos and builds the games.') +
+    row('3D people', ok(!!eng.blender, 'Blender ' + '(MPFB)', 'no Blender found'), eng.blender ? 'Builds new realistic 3D people for the Realistic 3D style (Toon Lab → 🧍).' : 'Install Blender to build new realistic 3D people; the two ready-made people still work.') +
+    row('Painter', ok(ex.painter && ex.painter.ready, 'Z-Image Turbo on this Mac', 'not installed'), `Scene pictures with no account and no network, ${ex.painter ? ex.painter.download : ''}. Until then pictures come from Hugging Face (login) or the free service.${logbox(ex.painter || {})}`, inst('painter', ex.painter || {}, 'Install the painter')) +
+    row('Video', ok(ex.video && ex.video.ready, 'Wan 2.2 TI2V-5B on this Mac', 'not installed'), `Turns pictures into a few seconds of moving video (B-roll, moving backgrounds). ${ex.video ? ex.video.download : ''}. Slow on a Mac: minutes per clip.${logbox(ex.video || {})}` + (ex.video && !ex.video.ready && !ex.video.installing ? `<div class="row" style="margin-top:6px"><input type="text" id="wanCkpt" placeholder="Already have the Wan2.2-TI2V-5B folder? Paste its path to skip the 32 GB download" value="${esc(ex.video.checkpoint || '')}"></div>` : ''), inst('video', ex.video || {}, 'Install video')) +
+    row('Lip-sync', ok(ex.lipsync && ex.lipsync.ready, 'MuseTalk 1.5 on this Mac', 'not installed'), `Real Avatar: redraws your mouth in your own green-screen footage to match every word. ${ex.lipsync ? ex.lipsync.download : ''}. Until then Real Avatar uses your footage as-is.${logbox(ex.lipsync || {})}`, inst('lipsync', ex.lipsync || {}, 'Install lip-sync')) +
+    row('Local model (Ollama)', llm.models && llm.models.length ? `<span class="ok">✓ ${llm.models.length} text model${llm.models.length === 1 ? '' : 's'}</span>` : '<span class="no">○ no text models</span>', `Writes scripts, episodes and game plans (the ✨ Director). ${speech ? `<b>${speech}</b> speech model${speech === 1 ? '' : 's'} with extra reader voices too (Phonon).` : 'For more reader voices: <code>ollama pull phonon</code>.'} Pull text models with <code>ollama pull qwen3.5:2b</code>.`) +
+    row('Disk', `<span class="${(ex.free_gb || 0) > 20 ? 'ok' : 'no'}">${ex.free_gb ?? '?'} GB free</span>`, 'Models live in engine/models and ~/.cache/huggingface.');
+  $('#engines').querySelectorAll('[data-install]').forEach(b => b.onclick = async () => {
+    b.disabled = true; const fd = new FormData(); fd.append('what', b.dataset.install); if (b.dataset.install === 'video' && $('#wanCkpt')) fd.append('checkpoint', $('#wanCkpt').value.trim());
+    try { await api('extras_install', fd); } catch (e) { alert(e.message); }
+    loadEngines();
+  });
+  const busy = ex.painter && (ex.painter.installing || (ex.video && ex.video.installing) || (ex.lipsync && ex.lipsync.installing));
+  clearTimeout(loadEngines.t); if (busy) loadEngines.t = setTimeout(loadEngines, 4000);
+}
+
+/* 🐍 recipes */
+async function loadRecipes() {
+  const r = await api('recipes').catch(() => null); if (!r) return;
+  const runs = r.runs || [];
+  $('#recipes').innerHTML = (r.recipes.length ? r.recipes.map(x => `<div class="recipe"><b>${esc(x.name.replace(/_/g, ' '))}</b> <span class="meta">${esc(x.doc)}</span>
+      <div class="row"><code title="Click to copy" data-copy="${esc(x.cmd)}">${esc(x.cmd)}</code><input type="text" placeholder="arguments, e.g. --topic 'local AI' --aspect 9:16" data-args="${esc(x.name)}"><button type="button" class="shrink" data-run="${esc(x.name)}">▶ Run</button></div>
+      ${runs.filter(u => u.recipe === x.name).slice(0, 1).map(u => `<div class="meta">last run: <span class="state ${u.state === 'done' ? 'done' : u.state === 'error' ? 'error' : ''}">${u.state}</span> ${u.args ? esc(u.args) : ''}</div><pre>${esc(u.log || '')}</pre>`).join('')}</div>`).join('') : '<div class="hint">No recipes found in recipes/.</div>') + (r.python ? '' : '<div class="err">python3 not found on PATH. Install it with: brew install python</div>');
+  $('#recipes').querySelectorAll('[data-copy]').forEach(c => c.onclick = () => { navigator.clipboard.writeText(c.dataset.copy).then(() => { c.textContent = 'copied ✓'; setTimeout(() => c.textContent = c.dataset.copy, 1200); }); });
+  $('#recipes').querySelectorAll('[data-run]').forEach(b => b.onclick = async () => {
+    const fd = new FormData(); fd.append('name', b.dataset.run); fd.append('args', ($('#recipes').querySelector(`[data-args="${b.dataset.run}"]`) || {}).value || '');
+    b.disabled = true; try { await api('recipe_run', fd); } catch (e) { alert(e.message); }
+    loadRecipes();
+  });
+  const busy = runs.some(u => u.state === 'running');
+  clearTimeout(loadRecipes.t); loadRecipes.t = setTimeout(loadRecipes, busy ? 3000 : 20000);
+}
+
+/* boot */
+(async () => {
+  [LIB.chars, LIB.voices, LIB.scenes, LIB.music, LIB.clips] = await Promise.all([api('chars').catch(() => []), api('voices').catch(() => []), api('scenes').catch(() => []), api('music').then(r => r.tracks || []).catch(() => []), api('clips').catch(() => [])]);
+  syncHeader(); renderScenes(); loadModels(); loadGallery(); loadJobs(); loadEngines(); loadRecipes();
+  const q = new URLSearchParams(location.search); if (q.get('remix')) try { fromEpisode(await api('show_get&id=' + q.get('remix'))); } catch (e) {}
+})();
+</script>
+<?php endif; ?>
+<?php if ($page === 'real'): ?>
+<main class="toon real">
+  <div class="side">
+    <details class="panel fold" data-fold="rf" open>
+      <summary><h2><span class="step">1</span> My footage <span class="meta">green screen</span></h2></summary>
+      <div class="drop" id="fDrop">Drop a green-screen clip of yourself here, or click to pick one<br><small>Talk to the camera for 15–60 s with a few pauses. Any MP4 / MOV. It is indexed: pauses, the green, your face.</small></div>
+      <input type="file" id="fFile" accept="video/mp4,video/quicktime,video/webm,video/*" hidden>
+      <div class="hint" id="fMsg"></div>
+      <div id="fList"></div>
+    </details>
+
+    <details class="panel fold" data-fold="rs" open>
+      <summary><h2><span class="step">2</span> Script &amp; my voice</h2></summary>
+      <textarea id="rNotes" rows="2" placeholder="Rough notes: what is this video about? (the local model turns it into what you'd say)"></textarea>
+      <div class="row"><select id="rSecs"><option value="30">~30 s</option><option value="45" selected>~45 s</option><option value="60">~60 s</option><option value="90">~90 s</option></select><select id="rTone"><option value="conversational">Conversational</option><option value="energetic">Energetic</option><option value="calm">Calm</option><option value="funny">Funny</option><option value="serious">Serious</option></select><select id="rModel"></select><button type="button" class="shrink" id="rWrite">✨ Write it</button></div>
+      <textarea id="rScript" rows="6" placeholder="…or type exactly what you say. First person, plain sentences. About 2.6 words per second."></textarea>
+      <div class="meta" id="rWords"></div>
+      <div class="row"><label class="lbl shrink">Voice</label><select id="rVoice"></select></div>
+      <div class="row"><label class="lbl shrink">Reader</label><select id="rReader"><?= tts_voice_options() ?></select></div>
+      <div class="field"><label>Speed</label><input type="range" id="rSpeed" min="0.7" max="1.4" step="0.05" value="1"><output></output></div>
+      <div class="hint">Your saved voice (record one on the Voice Swap page) makes it sound like you. The reader only sets the pacing and accent.</div>
+    </details>
+
+    <details class="panel fold" data-fold="rb" open>
+      <summary><h2><span class="step">3</span> Background &amp; placement</h2></summary>
+      <div class="drop" id="bDrop">Drop your screen recording (or any video) here<br><small>It plays behind you. Checked for a clean corner.</small></div>
+      <input type="file" id="bFile" accept="video/mp4,video/quicktime,video/webm,video/*" hidden>
+      <div class="hint" id="bMsg"></div>
+      <div id="bList"></div>
+      <div class="row" style="margin-top:8px"><label class="lbl shrink">Or</label><select id="bOther"><option value="">A solid color</option></select><input type="color" id="bColor" value="#101418" title="Solid color"></div>
+      <div class="opt"><b>Fit the background</b><div class="chips" id="rFit"><button type="button" data-v="blur">Blurred edges</button><button type="button" data-v="cover">Fill</button><button type="button" data-v="contain">Fit</button></div></div>
+      <div class="opt"><b>Where you go</b><div class="row"><div class="corner-pick" id="rCorner"><button type="button" data-v="tl">↖</button><button type="button" data-v="tc" disabled>·</button><button type="button" data-v="tr">↗</button><button type="button" data-v="cl" disabled>·</button><button type="button" data-v="c">●</button><button type="button" data-v="cr" disabled>·</button><button type="button" data-v="bl">↙</button><button type="button" data-v="bc">↓</button><button type="button" data-v="br">↘</button></div>
+        <div style="flex:1"><div class="field"><label>Size</label><input type="range" id="rSize" min="0.15" max="1" step="0.01" value="0.4"><output></output></div><div class="field"><label>Margin</label><input type="range" id="rMargin" min="0" max="0.2" step="0.005" value="0.035"><output></output></div><div class="field"><label>Crop width</label><input type="range" id="rCrop" min="0.3" max="1" step="0.02" value="0.8"><output></output></div></div></div></div>
+      <div class="row"><label class="check shrink"><input type="checkbox" id="rMirror"><span>Mirror</span></label><label class="check shrink"><input type="checkbox" id="rCircle"><span>Round bubble</span></label><label class="lbl shrink">Recording sound</label><input type="range" id="rBrollVol" min="0" max="1" step="0.02" value="0.12" style="flex:1"></div>
+    </details>
+
+    <details class="panel fold" data-fold="rc">
+      <summary><h2><span class="step">4</span> Subtitles &amp; captions</h2></summary>
+      <div class="opt"><b>Subtitles</b><div class="chips" id="rSubStyle"><button type="button" data-v="karaoke">Karaoke</button><button type="button" data-v="subtitle">Classic</button><button type="button" data-v="pop">Pop words</button><button type="button" data-v="off">Off</button></div></div>
+      <div class="row"><select id="rFont"><?php foreach (array_keys(real_fonts()) as $f) echo '<option value="' . htmlspecialchars($f) . '">' . htmlspecialchars($f) . '</option>'; ?></select><select id="rSubPos"><option value="auto">Position: auto</option><option value="top">Top</option><option value="middle">Middle</option><option value="bottom">Bottom</option></select></div>
+      <div class="row"><label class="lbl shrink">Colors</label><input type="color" id="rSubColor" value="#ffffff" title="Text"><input type="color" id="rSubHi" value="#ffd23f" title="Highlighted word"><label class="check shrink"><input type="checkbox" id="rSubBox" checked><span>Dark box</span></label></div>
+      <div class="field"><label>Size</label><input type="range" id="rSubSize" min="0.5" max="2" step="0.05" value="1"><output></output></div>
+      <div class="opt"><b>Captions</b><div id="rCaps"></div><div class="row"><button type="button" class="shrink" data-addcap="title">+ Title</button><button type="button" class="shrink" data-addcap="lower">+ Lower-third</button></div></div>
+    </details>
+
+    <section class="panel">
+      <h2><span class="step">5</span> Make it</h2>
+      <div class="opt"><b>Frame</b><div class="chips" id="rAspect"><button type="button" data-a="9:16">9:16 Shorts</button><button type="button" data-a="16:9">16:9</button><button type="button" data-a="1:1">1:1</button></div></div>
+      <div class="note" id="rEngine">Checking the lip-sync engine…</div>
+      <label class="check"><input type="checkbox" id="rExport"><span>Also export the keyed avatar alone (VP9 with transparency, for other editors)</span></label>
+      <button class="big" id="rMake" type="button">🎬 Make my video</button>
+      <div id="rProg" hidden><div class="bar"><i></i></div><div class="meta" id="rStage"></div></div>
+      <div class="err" id="rErr" hidden></div>
+      <div class="hint" id="rDone" hidden></div>
+    </section>
+  </div>
+
+  <div class="stagecol">
+    <section class="panel">
+      <canvas id="realPreview" width="1080" height="1920"></canvas>
+      <div class="hint" id="rPrevHint" style="margin-top:6px">Preview: a frame of the background with your keyed footage placed on it, and a sample subtitle. The real render lip-syncs the footage to your voice first.</div>
+      <video id="realPlayer" controls playsinline hidden style="margin-top:10px"></video>
+    </section>
+    <section class="panel">
+      <h2>🧑 My videos <span class="meta" id="rGalCount"></span></h2>
+      <div class="gallery" id="rGallery"></div>
+      <div id="rDiag" class="sheets"></div>
+    </section>
+    <section class="panel">
+      <h2>How it works</h2>
+      <div class="hint">1 · Your clip is indexed: where you pause, what green to key, your face (🧠 Analyze face runs MediaPipe in this browser, nothing leaves the Mac). Contact sheets let you check it.<br>
+      2 · Your notes become a script (local model), spoken in your cloned voice (Kokoro reader → Seed-VC).<br>
+      3 · The talking stretches of your footage are chained to cover the voice, then <b>MuseTalk</b> redraws your mouth to match every word, on the GPU.<br>
+      4 · The green is keyed out (ffmpeg chromakey + spill removal), you are placed over the recording, word-timed subtitles and captions are burned in, the sound is mixed. One MP4, in renders/ too.</div>
+    </section>
+  </div>
+</main>
+<script>
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const LIB = {footage: [], broll: [], scenes: [], clips: [], voices: []};
+const DEF = {footage: '', broll: '', brollKind: '', bgColor: '#101418', fit: 'blur', notes: '', script: '', voice: null, tts_voice: 'am_michael', speed: 1, aspect: '9:16',
+  avatar: {corner: 'bl', size: 0.4, margin: 0.035, mirror: false, shape: 'none', crop: 0.8}, subtitles: {style: 'karaoke', font: '<?= addslashes(isset(real_fonts()['Impact']) ? 'Impact' : (array_key_first(real_fonts()) ?: '')) ?>', size: 1, color: '#ffffff', hi: '#ffd23f', pos: 'auto', box: true},
+  captions: [], broll_audio: 0.12, export_avatar: false};
+let R = JSON.parse(JSON.stringify(DEF));
+try { const d = JSON.parse(localStorage.realDraft || 'null'); if (d) R = {...R, ...d, avatar: {...DEF.avatar, ...(d.avatar || {})}, subtitles: {...DEF.subtitles, ...(d.subtitles || {})}}; } catch (e) {}
+const save = () => { try { localStorage.realDraft = JSON.stringify(R); } catch (e) {} };
+const words = t => (t.trim().match(/\S+/g) || []).length;
+document.querySelectorAll('.field input[type=range]').forEach(r => { const o = r.parentElement.querySelector('output'); const f = () => { if (o) o.textContent = r.value; }; r.addEventListener('input', f); f(); });
+
+/* ── 1 · footage ── */
+async function upload(file, action, msgEl, listFn) {
+  msgEl.className = 'hint'; msgEl.textContent = `Uploading and preparing ${file.name} (${(file.size / 1048576).toFixed(0)} MB)…`;
+  try {
+    const fd = new FormData(); fd.append('video', file);
+    const r = await api(action, fd);
+    msgEl.textContent = `✓ ${r.title}: indexing…`;
+    for (;;) { await sleep(1500); const st = await api((action === 'footage_upload' ? 'footage_status' : 'broll_status') + '&id=' + r.job); msgEl.textContent = `✓ ${r.title}: ${st.stage || ''}`; if (st.state === 'error') throw new Error(st.error || 'Indexing failed'); if (st.state === 'done') break; }
+    msgEl.textContent = `✓ ${r.title} is ready.`;
+    await listFn(); return r.file;
+  } catch (e) { msgEl.className = 'err'; msgEl.textContent = e.message; }
+}
+const wireDrop = (drop, input, onFile) => {
+  drop.onclick = () => input.click(); input.onchange = () => { if (input.files[0]) onFile(input.files[0]); input.value = ''; };
+  drop.ondragover = e => { e.preventDefault(); drop.classList.add('over'); }; drop.ondragleave = () => drop.classList.remove('over');
+  drop.ondrop = e => { e.preventDefault(); drop.classList.remove('over'); const f = [...e.dataTransfer.files].find(f => /^video\//.test(f.type) || /\.(mp4|mov|webm|m4v)$/i.test(f.name)); if (f) onFile(f); };
+};
+wireDrop($('#fDrop'), $('#fFile'), async f => { const file = await upload(f, 'footage_upload', $('#fMsg'), loadFootage); if (file) { R.footage = file; save(); renderFootage(); preview(); } });
+wireDrop($('#bDrop'), $('#bFile'), async f => { const file = await upload(f, 'broll_upload', $('#bMsg'), loadBroll); if (file) { R.broll = file; R.brollKind = 'video'; const b = LIB.broll.find(x => x.file === file); if (b && b.index && b.index.recommend) { R.avatar.corner = b.index.recommend; } save(); renderBroll(); syncControls(); preview(); } });
+async function loadFootage() { LIB.footage = await api('footage').catch(() => []); if (!R.footage && LIB.footage[0]) R.footage = LIB.footage[0].file; renderFootage(); }
+function renderFootage() {
+  const host = $('#fList');
+  host.innerHTML = LIB.footage.length ? '' : '<div class="hint">No footage yet. Film yourself against a green (or blue) wall, drop the clip above.</div>';
+  for (const f of LIB.footage) {
+    const i = f.index || {}, card = document.createElement('div'); card.className = 'fcard' + (f.file === R.footage ? ' on' : '');
+    const facts = [`${(f.duration || i.duration || 0).toFixed ? (f.duration || i.duration || 0).toFixed(1) : f.duration} s`, i.width ? `${i.width}×${i.height}` : '', i.key ? `key ${i.key.color}` : '', (i.idle || []).length ? `${i.idle.length} pause${i.idle.length === 1 ? '' : 's'}` : 'no pauses found', i.analyzed ? '🧠 face analyzed' : 'face not analyzed yet'].filter(Boolean).join(' · ');
+    card.innerHTML = `<div class="checker">${f.preview ? `<video muted loop playsinline preload="metadata" src="footage/${encodeURIComponent(f.preview)}"></video>` : `<img class="sheetimg" src="${f.sheets && f.sheets[0] ? 'footage/' + encodeURIComponent(f.sheets[0]) : ''}" alt="">`}</div>
+      <div><div class="ft">${esc(f.title)}</div><div class="facts">${esc(facts)}</div>
+      <div class="acts"><button type="button" data-use>${f.file === R.footage ? '✓ Using this' : 'Use this'}</button><button type="button" data-face>🧠 Analyze face</button><button type="button" data-sheets>🔍 Check</button><button type="button" data-key>🎚 Key</button><button type="button" data-del title="Delete">🗑</button></div>
+      <div class="more" hidden></div></div>`;
+    const v = card.querySelector('video'); if (v) { card.onmouseenter = () => v.play().catch(() => {}); card.onmouseleave = () => { v.pause(); }; }
+    card.querySelector('[data-use]').onclick = () => { R.footage = f.file; save(); renderFootage(); preview(); };
+    card.querySelector('[data-face]').onclick = () => analyzeFace(f, card);
+    card.querySelector('[data-sheets]').onclick = () => { const m = card.querySelector('.more'); m.hidden = !m.hidden; if (!m.hidden) m.innerHTML = (f.sheets || []).length ? f.sheets.map(sh => `<div class="meta">${esc(sh.replace(/^.*?\.(?=[a-z0-9-]+\.jpg$)/, ''))}</div><img src="footage/${encodeURIComponent(sh)}?t=${f.time}" alt="">`).join('') + '<div class="hint">silent-windows: the middle of each pause (eyes open? mouth closed?). p0-frames: 12 frames around the best neutral moment. talk-frames: the stretches used for lip-sync.</div>' : '<div class="hint">No contact sheets yet.</div>'; };
+    card.querySelector('[data-key]').onclick = () => { const m = card.querySelector('.more'); m.hidden = !m.hidden; if (m.hidden) return; const k = i.key || {};
+      m.innerHTML = `<div class="row"><label class="lbl shrink">Green</label><input type="color" data-k="color" value="${k.color || '#00ff00'}"><label class="lbl shrink">Similarity</label><input type="range" data-k="similarity" min="0.03" max="0.5" step="0.01" value="${k.similarity ?? 0.12}"><label class="lbl shrink">Soft edge</label><input type="range" data-k="blend" min="0" max="0.5" step="0.01" value="${k.blend ?? 0.08}"></div>
+        <div class="row"><label class="lbl shrink">Spill removal</label><input type="range" data-k="despill" min="0" max="1" step="0.05" value="${k.despill ?? 0.6}"><button type="button" class="shrink" data-rekey>↻ Re-key the preview</button></div><div class="hint">Similarity 0.08–0.15 keys a lit screen cleanly; higher starts eating hair and clothes. Soft edge feathers the outline.</div>`;
+      m.querySelector('[data-rekey]').onclick = async () => { const fd = new FormData(); fd.append('file', f.file); m.querySelectorAll('[data-k]').forEach(el => fd.append(el.dataset.k, el.value)); $('#fMsg').className = 'hint'; $('#fMsg').textContent = 'Re-keying…';
+        try { const r = await api('footage_index', fd); for (;;) { await sleep(1500); const st = await api('footage_status&id=' + r.job); $('#fMsg').textContent = st.stage || ''; if (st.state === 'error') throw new Error(st.error); if (st.state === 'done') break; } $('#fMsg').textContent = '✓ Re-keyed.'; await loadFootage(); preview(); } catch (e) { $('#fMsg').className = 'err'; $('#fMsg').textContent = e.message; } };
+    };
+    card.querySelector('[data-del]').onclick = async () => { if (card.dataset.armed !== '1') { card.dataset.armed = '1'; card.querySelector('[data-del]').textContent = 'Sure?'; setTimeout(() => { card.dataset.armed = ''; card.querySelector('[data-del]').textContent = '🗑'; }, 3000); return; } const fd = new FormData(); fd.append('file', f.file); await api('footage_delete', fd).catch(() => {}); if (R.footage === f.file) R.footage = ''; await loadFootage(); preview(); };
+    host.appendChild(card);
+  }
+}
+/* 🧠 face analysis in the browser: MediaPipe reads blendshapes frame by frame → idle windows, neutral frames, the face box */
+let FACE = null;
+async function analyzeFace(f, card) {
+  const btn = card.querySelector('[data-face]'); btn.disabled = true; $('#fMsg').className = 'hint'; $('#fMsg').textContent = 'Loading the face model…';
+  try {
+    if (!FACE) {
+      const V = await import('./vendor/mediapipe/vision_bundle.mjs'); const fs = await V.FilesetResolver.forVisionTasks('vendor/mediapipe/wasm');
+      const make = async d => V.FaceLandmarker.createFromOptions(fs, {baseOptions: {modelAssetPath: 'vendor/mediapipe/models/face_landmarker.task', delegate: d}, runningMode: 'VIDEO', numFaces: 1, outputFaceBlendshapes: true});
+      try { FACE = await make('GPU'); } catch (e) { FACE = await make('CPU'); }
+    }
+    const v = document.createElement('video'); v.muted = true; v.playsInline = true; v.src = 'footage/' + encodeURIComponent(f.file); v.playbackRate = 1;
+    await new Promise((res, rej) => { v.onloadedmetadata = res; v.onerror = () => rej(new Error('Could not open the clip.')); });
+    const frames = []; let last = -1;
+    await v.play();
+    await new Promise(res => {
+      const tick = () => {
+        if (v.ended) return res();
+        const t = v.currentTime;
+        if (t !== last) { last = t; const r = FACE.detectForVideo(v, performance.now()); const bs = {}; (r.faceBlendshapes && r.faceBlendshapes[0] ? r.faceBlendshapes[0].categories : []).forEach(c => bs[c.categoryName] = c.score);
+          let box = null; if (r.faceLandmarks && r.faceLandmarks[0]) { let x0 = 1, y0 = 1, x1 = 0, y1 = 0; for (const p of r.faceLandmarks[0]) { x0 = Math.min(x0, p.x); y0 = Math.min(y0, p.y); x1 = Math.max(x1, p.x); y1 = Math.max(y1, p.y); } box = [x0, y0, x1 - x0, y1 - y0]; }
+          frames.push({t, jaw: bs.jawOpen || 0, blink: Math.max(bs.eyeBlinkLeft || 0, bs.eyeBlinkRight || 0), box });
+          $('#fMsg').textContent = `🧠 Analyzing ${t.toFixed(1)} / ${v.duration.toFixed(1)} s · ${frames.filter(x => x.box).length} frames with a face`; }
+        (v.requestVideoFrameCallback ? v.requestVideoFrameCallback(tick) : requestAnimationFrame(tick));
+      }; tick();
+    });
+    if (frames.filter(x => x.box).length < 10) throw new Error('No face found in that clip. Face the camera, with light on you.');
+    const dur = v.duration, n = frames.length;
+    const sm = frames.map((x, i) => { const w = frames.slice(Math.max(0, i - 3), i + 4); return w.reduce((a, y) => a + y.jaw, 0) / w.length; });
+    const talking = sm.map(j => j > 0.1);
+    const runs = (pred, minLen, gap) => { const out = []; let start = null, lastT = null; frames.forEach((x, i) => { if (pred(i)) { if (start === null) start = x.t; lastT = x.t; } else if (start !== null && x.t - lastT > gap) { if (lastT - start >= minLen) out.push([+start.toFixed(2), +lastT.toFixed(2)]); start = null; } }); if (start !== null && lastT - start >= minLen) out.push([+start.toFixed(2), +lastT.toFixed(2)]); return out; };
+    const idle = runs(i => !talking[i], 0.8, 0.25), talk = runs(i => talking[i], 0.4, 0.35);
+    const neutral = [];
+    for (const [a, b] of idle) { const cand = frames.filter((x, i) => x.t >= a + 0.15 && x.t <= b - 0.15 && x.blink < 0.25 && x.box && (i === 0 || !frames[i - 1].box || Math.abs(frames[i - 1].box[0] - x.box[0]) < 0.004)); if (cand.length) neutral.push(+cand[Math.floor(cand.length / 2)].t.toFixed(2)); }
+    const boxes = frames.filter(x => x.box).map(x => x.box).sort((p, q) => p[2] * p[3] - q[2] * q[3]); const mb = boxes[Math.floor(boxes.length / 2)];
+    const blinks = frames.filter((x, i) => x.blink > 0.5 && (i === 0 || frames[i - 1].blink <= 0.5)).length;
+    const index = {face: {box: mb.map(x => +x.toFixed(4))}, idle, talk: talk.length ? talk : [[0, +dur.toFixed(2)]], neutral: neutral.slice(0, 6), analyzed: 'mediapipe', frames: n, blinks};
+    $('#fMsg').textContent = `🧠 ${talk.length} talking stretches, ${idle.length} idle windows, ${neutral.length} neutral frames, ${blinks} blinks. Saving and redrawing the sheets…`;
+    const fd = new FormData(); fd.append('file', f.file); fd.append('index', JSON.stringify(index));
+    const r = await api('footage_save_index', fd);
+    for (;;) { await sleep(1500); const st = await api('footage_status&id=' + r.job); if (st.state === 'error') throw new Error(st.error); if (st.state === 'done') break; }
+    $('#fMsg').textContent = `✓ Face analyzed: ${talk.length} talking stretches, ${idle.length} idle windows, ${neutral.length} neutral frames. 🔍 Check shows the sheets.`;
+    await loadFootage(); preview();
+  } catch (e) { $('#fMsg').className = 'err'; $('#fMsg').textContent = e.message; }
+  btn.disabled = false;
+}
+
+/* ── 2 · script & voice ── */
+async function loadModels() {
+  const sel = $('#rModel'); sel.innerHTML = '<option value="">loading…</option>';
+  try { const r = await api('llm_models'); sel.innerHTML = r.models.length ? r.models.map(m => `<option value="${esc(m.id)}">🧠 ${esc(m.id)}</option>`).join('') : '<option value="">no text models: ollama pull qwen3.5:2b</option>'; if (r.models.some(m => m.id === r.llm_model)) sel.value = r.llm_model; } catch (e) { sel.innerHTML = '<option value="">⚠ model server off</option>'; }
+}
+$('#rWrite').onclick = async () => {
+  const notes = $('#rNotes').value.trim(); if (!notes) { $('#rNotes').focus(); return; }
+  $('#rWrite').disabled = true; $('#rWords').textContent = `${$('#rModel').value || 'The local model'} is writing…`;
+  try { const fd = new FormData(); fd.append('notes', notes); fd.append('seconds', $('#rSecs').value); fd.append('tone', $('#rTone').value); fd.append('model', $('#rModel').value); const r = await api('real_script', fd); $('#rScript').value = r.script; R.script = r.script; save(); wordsMsg(); }
+  catch (e) { $('#rWords').textContent = e.message; }
+  $('#rWrite').disabled = false;
+};
+const wordsMsg = () => { const w = words($('#rScript').value); $('#rWords').textContent = w ? `${w} words ≈ ${Math.round(w / 2.6)} s` : ''; };
+$('#rNotes').oninput = () => { R.notes = $('#rNotes').value; save(); };
+$('#rScript').oninput = () => { R.script = $('#rScript').value; save(); wordsMsg(); };
+$('#rVoice').onchange = () => { R.voice = $('#rVoice').value; save(); };
+$('#rReader').onchange = () => { R.tts_voice = $('#rReader').value; save(); };
+$('#rSpeed').oninput = () => { R.speed = +$('#rSpeed').value; save(); };
+
+/* ── 3 · background & placement ── */
+async function loadBroll() { [LIB.broll, LIB.scenes, LIB.clips] = await Promise.all([api('broll').catch(() => []), api('scenes').catch(() => []), api('clips').catch(() => [])]); renderBroll(); }
+function renderBroll() {
+  const host = $('#bList');
+  host.innerHTML = LIB.broll.length ? '' : '<div class="hint">No recordings yet. QuickTime → File → New Screen Recording, then drop the file above.</div>';
+  for (const b of LIB.broll) {
+    const i = b.index || {}, card = document.createElement('div'); card.className = 'fcard' + (R.brollKind === 'video' && b.file === R.broll ? ' on' : '');
+    const corners = i.corners ? Object.entries(i.corners).map(([k, v]) => `${{tl: '↖', tr: '↗', bl: '↙', br: '↘'}[k]} ${v}`).join('  ') : '';
+    card.innerHTML = `<div><video muted preload="metadata" src="broll/${encodeURIComponent(b.file)}#t=1"></video></div><div><div class="ft">${esc(b.title)}</div><div class="facts">${(b.duration || 0)} s${i.width ? ` · ${i.width}×${i.height}` : ''}${i.recommend ? ` · cleanest corner: <b>${{tl: 'top-left', tr: 'top-right', bl: 'bottom-left', br: 'bottom-right'}[i.recommend]}</b> (edge scores ${esc(corners)})` : ''}</div>
+      <div class="acts"><button type="button" data-use>${R.brollKind === 'video' && b.file === R.broll ? '✓ Using this' : 'Use this'}</button><button type="button" data-sheet>🔍 Frames</button><button type="button" data-ask>🧠 Ask the vision model</button><button type="button" data-del>🗑</button></div><div class="more" hidden></div></div>`;
+    card.querySelector('[data-use]').onclick = () => { R.broll = b.file; R.brollKind = 'video'; if (i.recommend) R.avatar.corner = i.recommend; save(); renderBroll(); syncControls(); preview(); };
+    card.querySelector('[data-sheet]').onclick = () => { const m = card.querySelector('.more'); m.hidden = !m.hidden; if (!m.hidden) m.innerHTML = b.sheet ? `<img src="broll/${encodeURIComponent(b.sheet)}" alt="">` : '<div class="hint">No frames sheet.</div>'; };
+    card.querySelector('[data-ask]').onclick = async () => { const m = card.querySelector('.more'); m.hidden = false; m.innerHTML = '<div class="hint">Asking the local vision model… (30–90 s)</div>';
+      try { const fd = new FormData(); fd.append('image', 'broll/' + b.sheet); fd.append('question', 'These are 8 frames from a screen recording. A small video of a person will be placed in one corner. Which corner has the least text and UI in it across the frames: bottom-left, bottom-right, top-left or top-right? Answer with that corner first, then one sentence why, and mention any subtitles or captions burned into the frames.'); const r = await api('vision_check', fd); m.innerHTML = `<div class="note">🧠 ${esc(r.answer)}</div>`; }
+      catch (e) { m.innerHTML = `<div class="err">${esc(e.message)}</div>`; } };
+    card.querySelector('[data-del]').onclick = async () => { const fd = new FormData(); fd.append('file', b.file); await api('broll_delete', fd).catch(() => {}); if (R.broll === b.file) { R.broll = ''; R.brollKind = ''; } await loadBroll(); preview(); };
+    host.appendChild(card);
+  }
+  const sel = $('#bOther');
+  sel.innerHTML = '<option value="">A solid color</option>' + LIB.scenes.map(m => `<option value="image:${esc(m.file)}">🖼 ${esc(m.title)}</option>`).join('') + LIB.clips.map(m => `<option value="clip:${esc(m.file)}">🎞 ${esc(m.title)}</option>`).join('');
+  sel.value = R.brollKind === 'image' ? 'image:' + R.broll : R.brollKind === 'clip' ? 'clip:' + R.broll : '';
+}
+$('#bOther').onchange = () => { const v = $('#bOther').value; if (!v) { R.broll = ''; R.brollKind = ''; } else { const [k, f] = v.split(/:(.*)/); R.brollKind = k; R.broll = f; } save(); renderBroll(); preview(); };
+$('#bColor').oninput = () => { R.bgColor = $('#bColor').value; save(); preview(); };
+document.querySelectorAll('#rFit button').forEach(b => b.onclick = () => { R.fit = b.dataset.v; save(); syncControls(); preview(); });
+document.querySelectorAll('#rCorner button:not([disabled])').forEach(b => b.onclick = () => { R.avatar.corner = b.dataset.v; save(); syncControls(); preview(); });
+['rSize:size', 'rMargin:margin', 'rCrop:crop'].forEach(x => { const [id, k] = x.split(':'); $('#' + id).oninput = () => { R.avatar[k] = +$('#' + id).value; save(); preview(); }; });
+$('#rMirror').onchange = () => { R.avatar.mirror = $('#rMirror').checked; save(); preview(); };
+$('#rCircle').onchange = () => { R.avatar.shape = $('#rCircle').checked ? 'circle' : 'none'; save(); preview(); };
+$('#rBrollVol').oninput = () => { R.broll_audio = +$('#rBrollVol').value; save(); };
+
+/* ── 4 · subtitles & captions ── */
+document.querySelectorAll('#rSubStyle button').forEach(b => b.onclick = () => { R.subtitles.style = b.dataset.v; save(); syncControls(); preview(); });
+$('#rFont').onchange = () => { R.subtitles.font = $('#rFont').value; save(); preview(); };
+$('#rSubPos').onchange = () => { R.subtitles.pos = $('#rSubPos').value; save(); preview(); };
+$('#rSubColor').oninput = () => { R.subtitles.color = $('#rSubColor').value; save(); preview(); };
+$('#rSubHi').oninput = () => { R.subtitles.hi = $('#rSubHi').value; save(); preview(); };
+$('#rSubBox').onchange = () => { R.subtitles.box = $('#rSubBox').checked; save(); preview(); };
+$('#rSubSize').oninput = () => { R.subtitles.size = +$('#rSubSize').value; save(); preview(); };
+function renderCaps() {
+  const host = $('#rCaps'); host.innerHTML = R.captions.length ? '' : '<div class="hint">Titles and lower-thirds, with their time in seconds.</div>';
+  R.captions.forEach((c, i) => {
+    const row = document.createElement('div'); row.className = 'cap-row';
+    row.innerHTML = `<select data-k="kind"><option value="title"${c.kind === 'title' ? ' selected' : ''}>Title</option><option value="lower"${c.kind === 'lower' ? ' selected' : ''}>Lower-third</option></select><input type="text" data-k="text" value="${esc(c.text)}" placeholder="text"><input type="number" data-k="start" value="${c.start}" step="0.5" min="0" title="start (s)"><input type="number" data-k="end" value="${c.end}" step="0.5" min="0" title="end (s)"><input type="color" data-k="color" value="${c.color || (c.kind === 'title' ? '#ffd23f' : '#e63946')}"><button type="button" data-x>✕</button>`;
+    row.querySelectorAll('[data-k]').forEach(el => el.addEventListener('input', () => { c[el.dataset.k] = el.type === 'number' ? +el.value : el.value; save(); preview(); }));
+    row.querySelector('[data-x]').onclick = () => { R.captions.splice(i, 1); save(); renderCaps(); preview(); };
+    host.appendChild(row);
+  });
+}
+document.querySelectorAll('[data-addcap]').forEach(b => b.onclick = () => { R.captions.push(b.dataset.addcap === 'title' ? {kind: 'title', text: 'MY TITLE', start: 0.3, end: 3.5, color: '#ffd23f'} : {kind: 'lower', text: 'Your name · what you do', start: 1, end: 6, color: '#e63946'}); save(); renderCaps(); preview(); });
+
+/* ── 5 · make ── */
+document.querySelectorAll('#rAspect button').forEach(b => b.onclick = () => { R.aspect = b.dataset.a; save(); syncControls(); preview(); });
+$('#rExport').onchange = () => { R.export_avatar = $('#rExport').checked; save(); };
+async function loadEngine() {
+  const ex = await api('extras').catch(() => null); if (!ex) return;
+  const l = ex.lipsync || {};
+  $('#rEngine').innerHTML = l.ready ? '✓ <b>Lip-sync is installed</b> (MuseTalk 1.5 on the GPU). Your mouth will follow every word.'
+    : l.installing ? `⏳ <b>Installing lip-sync…</b> ${esc((l.log || '').split('\n').filter(Boolean).slice(-1)[0] || '')}`
+    : `○ <b>Lip-sync is not installed yet</b>, so videos use your footage as-is (your mouth will not match the words). It is a one-time ${esc(l.download || '')}. <button type="button" id="rInstall">⬇ Install lip-sync</button>`;
+  const b = $('#rInstall'); if (b) b.onclick = async () => { b.disabled = true; const fd = new FormData(); fd.append('what', 'lipsync'); try { await api('extras_install', fd); } catch (e) { alert(e.message); } loadEngine(); };
+  clearTimeout(loadEngine.t); if (l.installing) loadEngine.t = setTimeout(loadEngine, 4000);
+}
+function toSpec() {
+  const sp = {title: ($('#rScript').value.trim().split(/\s+/).slice(0, 6).join(' ') || 'Real Avatar'), footage: R.footage, broll: R.broll, bgColor: R.bgColor, fit: R.fit, script: $('#rScript').value, voice: $('#rVoice').value, tts_voice: $('#rReader').value, speed: +$('#rSpeed').value,
+    aspect: R.aspect, avatar: {...R.avatar}, subtitles: {...R.subtitles}, captions: R.captions.map(c => ({...c})), broll_audio: R.broll_audio, export_avatar: !!R.export_avatar, lipsync: 'auto'};
+  return sp;
+}
+$('#rMake').onclick = async () => {
+  if (!R.footage) { $('#rErr').textContent = 'Pick (or upload) your footage first.'; $('#rErr').hidden = false; return; }
+  if (!$('#rScript').value.trim()) { $('#rErr').textContent = 'Write the script first (or ✨ Write it from notes).'; $('#rErr').hidden = false; return; }
+  $('#rErr').hidden = true; $('#rDone').hidden = true; $('#rMake').disabled = true; $('#rProg').hidden = false; $('#rProg i').style.width = '1%'; $('#rStage').textContent = 'Starting…';
+  try {
+    const r = await api('real_make', JSON.stringify(toSpec()));
+    for (;;) {
+      await sleep(2000);
+      const st = await api('real_status&id=' + r.id);
+      $('#rProg i').style.width = Math.round((st.progress || 0) * 100) + '%'; $('#rStage').textContent = st.stage || '';
+      if (st.state === 'error') throw new Error((st.error || 'Failed') + (st.log ? '\n\n' + st.log.trim().split('\n').slice(-4).join('\n') : ''));
+      if (st.state === 'done') { $('#rDone').innerHTML = `✓ Done: <b>${esc(st.render || '')}</b> (${st.duration || '?'} s, ${st.seconds || '?'} s to make).${st.warning ? ' ⚠ ' + esc(st.warning) : ''}`; $('#rDone').hidden = false; playRender(st.render); await loadGallery(r.id); showDiag(st); break; }
+    }
+  } catch (e) { $('#rErr').textContent = e.message; $('#rErr').hidden = false; }
+  $('#rMake').disabled = false;
+};
+function playRender(f) { if (!f) return; const v = $('#realPlayer'); v.hidden = false; v.src = '?a=render&f=' + encodeURIComponent(f); v.play().catch(() => {}); v.scrollIntoView({behavior: 'smooth', block: 'nearest'}); }
+function showDiag(st) { $('#rDiag').innerHTML = (st.diagnostics || []).length ? '<div class="subhead">🔬 Diagnostics of this run</div>' + st.diagnostics.map(d => `<div class="meta">${esc(d.split('/').pop())}</div><img src="${esc(d)}?t=${Date.now()}" alt="" onclick="window.open(this.src)">`).join('') + (st.avatar ? `<div class="meta">keyed avatar: <a href="${esc(st.avatar)}" download>${esc(st.avatar.split('/').pop())}</a> · lip-synced footage: <a href="${esc(st.synced || '')}" download>synced.mp4</a></div>` : '') : ''; }
+async function loadGallery(flash) {
+  const list = await api('reals').catch(() => []);
+  $('#rGalCount').textContent = list.length ? `· ${list.length}` : '';
+  $('#rGallery').innerHTML = list.length ? list.map(g => `<div class="gcard${g.id === flash ? ' flash' : ''}"><div class="gthumb" style="${g.render ? `background-image:url('?a=render_thumb&f=${encodeURIComponent(g.render)}')` : ''}"><span>${g.state === 'done' ? (g.lipsync === 'musetalk' ? '👄 synced' : 'as-is') : esc(g.state === 'error' ? 'failed' : (g.stage || g.state))}</span></div>
+      <div class="gt">${esc(g.title)}</div><div class="meta">${g.duration ? g.duration + ' s · ' : ''}${g.aspect} · ${new Date(g.time * 1000).toLocaleDateString([], {month: 'short', day: 'numeric'})}</div>
+      <div class="gacts">${g.render ? `<button type="button" data-play="${esc(g.render)}">▶</button><a href="?a=render&f=${encodeURIComponent(g.render)}&dl=1" title="Download">⬇</a>` : ''}<button type="button" data-diag="${g.id}" title="Diagnostics">🔬</button><button type="button" data-remix="${g.id}" title="Load into the editor">✎</button><button type="button" data-del="${g.id}" title="Delete">🗑</button></div></div>`).join('')
+    : '<div class="empty">No videos yet. Footage + script + background, then 🎬.</div>';
+  $('#rGallery').querySelectorAll('[data-play]').forEach(b => b.onclick = () => playRender(b.dataset.play));
+  $('#rGallery').querySelectorAll('[data-diag]').forEach(b => b.onclick = async () => showDiag(await api('real_status&id=' + b.dataset.diag)));
+  $('#rGallery').querySelectorAll('[data-remix]').forEach(b => b.onclick = async () => { try { const sp = await api('real_get&id=' + b.dataset.remix); R = {...R, footage: sp.footage, broll: sp.broll, brollKind: sp.broll_kind, bgColor: sp.bgColor, fit: sp.fit, script: sp.script, voice: sp.voice, tts_voice: sp.tts_voice, speed: sp.speed, aspect: sp.aspect, avatar: {...DEF.avatar, ...sp.avatar}, subtitles: {...DEF.subtitles, ...sp.subtitles}, captions: sp.captions || [], broll_audio: sp.broll_audio}; save(); syncControls(); renderFootage(); renderBroll(); renderCaps(); preview(); window.scrollTo({top: 0, behavior: 'smooth'}); } catch (e) { alert(e.message); } });
+  $('#rGallery').querySelectorAll('[data-del]').forEach(b => b.onclick = async () => { if (b.dataset.armed !== '1') { b.dataset.armed = '1'; b.textContent = 'Sure?'; setTimeout(() => { b.dataset.armed = ''; b.textContent = '🗑'; }, 3000); return; } const fd = new FormData(); fd.append('id', b.dataset.del); await api('real_delete', fd).catch(() => {}); loadGallery(); });
+}
+
+/* ── the preview canvas: one background frame + the keyed footage placed on it + a sample subtitle ── */
+const PV = {bg: null, bgKey: '', av: null, avKey: ''};
+function loadMedia(url, isVideo) {
+  return new Promise(res => { if (isVideo) { const v = document.createElement('video'); v.muted = true; v.playsInline = true; v.preload = 'auto'; v.src = url; v.onloadeddata = () => { v.currentTime = Math.min(1, (v.duration || 2) / 2); }; v.onseeked = () => res(v); v.onerror = () => res(null); } else { const im = new Image(); im.onload = () => res(im); im.onerror = () => res(null); im.src = url; } });
+}
+async function preview() {
+  const W = R.aspect === '16:9' ? 1920 : 1080, H = R.aspect === '9:16' ? 1920 : 1080;
+  const c = $('#realPreview'); c.width = W; c.height = H; const g = c.getContext('2d');
+  g.fillStyle = R.bgColor || '#101418'; g.fillRect(0, 0, W, H);
+  const bgKey = R.brollKind + ':' + R.broll;
+  if (R.broll && bgKey !== PV.bgKey) { PV.bgKey = bgKey; PV.bg = await loadMedia(R.brollKind === 'image' ? 'scenes/' + encodeURIComponent(R.broll) : (R.brollKind === 'clip' ? 'clips/' : 'broll/') + encodeURIComponent(R.broll), R.brollKind !== 'image'); }
+  const bg = R.broll ? PV.bg : null;
+  if (bg) {
+    const iw = bg.videoWidth || bg.naturalWidth, ih = bg.videoHeight || bg.naturalHeight;
+    if (R.fit === 'cover') { const k = Math.max(W / iw, H / ih); g.drawImage(bg, (W - iw * k) / 2, (H - ih * k) / 2, iw * k, ih * k); }
+    else { if (R.fit === 'blur') { const k = Math.max(W / iw, H / ih); g.filter = 'blur(28px) brightness(0.85)'; g.drawImage(bg, (W - iw * k) / 2, (H - ih * k) / 2, iw * k, ih * k); g.filter = 'none'; } const k = Math.min(W / iw, H / ih); g.drawImage(bg, (W - iw * k) / 2, (H - ih * k) / 2, iw * k, ih * k); }
+  }
+  const f = LIB.footage.find(x => x.file === R.footage);
+  const avKey = f ? f.preview + ':' + f.time : '';
+  if (f && f.preview && avKey !== PV.avKey) { PV.avKey = avKey; PV.av = await loadMedia('footage/' + encodeURIComponent(f.preview), true); }
+  const a = R.avatar, avh = H * a.size, m = H * a.margin;
+  let aw = avh * 0.8;
+  if (f && PV.av) {
+    const v = PV.av, iw = v.videoWidth, ih = v.videoHeight, cw = Math.min(iw, ih * a.crop), box = f.index && f.index.face && f.index.face.box, cx = box ? (box[0] + box[2] / 2) * iw : iw / 2, sx = Math.min(Math.max(0, cx - cw / 2), iw - cw);
+    aw = a.shape === 'circle' ? avh : avh * cw / ih;
+    const pos = place(a.corner, W, H, aw, avh, m);
+    g.save();
+    if (a.shape === 'circle') { g.beginPath(); g.arc(pos.x + avh / 2, pos.y + avh / 2, avh / 2 - 2, 0, Math.PI * 2); g.clip(); }
+    if (a.mirror) { g.translate(pos.x + aw, pos.y); g.scale(-1, 1); g.translate(-pos.x, -pos.y); }
+    if (a.shape === 'circle') { const side = Math.min(cw, ih); g.drawImage(v, sx + (cw - side) / 2, 0, side, side, pos.x, pos.y, avh, avh); }
+    else g.drawImage(v, sx, 0, cw, ih, pos.x, pos.y, aw, avh);
+    g.restore();
+  } else { const pos = place(a.corner, W, H, aw, avh, m); g.fillStyle = 'rgba(255,255,255,.15)'; g.fillRect(pos.x, pos.y, aw, avh); g.fillStyle = '#fff'; g.font = `${Math.round(H * 0.02)}px system-ui`; g.textAlign = 'center'; g.fillText('your footage', pos.x + aw / 2, pos.y + avh / 2); }
+  const pos = place(a.corner, W, H, aw, avh, m);
+  if (R.subtitles.style !== 'off') {
+    const sub = R.subtitles, size = Math.min(W, H) * 0.058 * sub.size; g.font = `bold ${size}px "${sub.font}", Impact, sans-serif`; g.textAlign = 'center';
+    let y = sub.pos === 'top' ? H * 0.14 : sub.pos === 'middle' ? H * 0.5 : sub.pos === 'bottom' ? H * 0.84 : (pos.y > H * 0.45 ? Math.max(H * 0.2, pos.y - Math.min(W, H) * 0.09) : Math.min(H * 0.86, pos.y + avh + Math.min(W, H) * 0.09));
+    const line = sub.style === 'pop' ? ['WORD'] : ['every word lights', 'up as you say it'];
+    line.forEach((t, i) => { const yy = y + (i - (line.length - 1) / 2) * size * 1.25; const w = g.measureText(t).width; if (sub.box) { g.fillStyle = 'rgba(0,0,0,.6)'; g.fillRect(W / 2 - w / 2 - size * .3, yy - size * .95, w + size * .6, size * 1.25); } g.lineWidth = size * .12; g.strokeStyle = '#000'; g.strokeText(t, W / 2, yy); g.fillStyle = i === 0 ? sub.hi : sub.color; g.fillText(t, W / 2, yy); });
+  }
+  for (const cp of R.captions.slice(0, 2)) {
+    const f2 = Math.min(W, H) * (cp.kind === 'title' ? 0.075 : 0.042); g.font = `bold ${f2}px "${R.subtitles.font}", Impact, sans-serif`;
+    if (cp.kind === 'title') { g.textAlign = 'center'; g.lineWidth = f2 * .12; g.strokeStyle = '#000'; g.strokeText(cp.text, W / 2, H * 0.07 + f2); g.fillStyle = cp.color || '#ffd23f'; g.fillText(cp.text, W / 2, H * 0.07 + f2); }
+    else { g.textAlign = 'left'; const w = g.measureText(cp.text).width, pad = f2 * .45, x = pos.x < W / 2 ? W - w - pad * 2 - W * .04 : W * .04, y = H * 0.9 - f2 * 1.2; g.fillStyle = cp.color || '#e63946'; g.fillRect(x, y, w + pad * 2, f2 * 1.2 + pad / 2); g.fillStyle = '#fff'; g.fillText(cp.text, x + pad, y + f2); }
+  }
+}
+function place(corner, W, H, w, h, m) { return {bl: {x: m, y: H - h - m}, br: {x: W - w - m, y: H - h - m}, tl: {x: m, y: m}, tr: {x: W - w - m, y: m}, bc: {x: (W - w) / 2, y: H - h - m}, c: {x: (W - w) / 2, y: (H - h) / 2}}[corner] || {x: m, y: H - h - m}; }
+
+function syncControls() {
+  $('#rNotes').value = R.notes || ''; $('#rScript').value = R.script || ''; wordsMsg(); $('#rReader').value = R.tts_voice || 'am_michael'; $('#rSpeed').value = R.speed || 1; $('#rSpeed').dispatchEvent(new Event('input'));
+  $('#bColor').value = R.bgColor || '#101418';
+  document.querySelectorAll('#rFit button').forEach(b => b.classList.toggle('on', b.dataset.v === R.fit));
+  document.querySelectorAll('#rCorner button').forEach(b => b.classList.toggle('on', b.dataset.v === R.avatar.corner));
+  $('#rSize').value = R.avatar.size; $('#rMargin').value = R.avatar.margin; $('#rCrop').value = R.avatar.crop; ['rSize', 'rMargin', 'rCrop', 'rSubSize'].forEach(id => $('#' + id).dispatchEvent(new Event('input')));
+  $('#rMirror').checked = !!R.avatar.mirror; $('#rCircle').checked = R.avatar.shape === 'circle'; $('#rBrollVol').value = R.broll_audio;
+  document.querySelectorAll('#rSubStyle button').forEach(b => b.classList.toggle('on', b.dataset.v === R.subtitles.style));
+  $('#rFont').value = R.subtitles.font; $('#rSubPos').value = R.subtitles.pos; $('#rSubColor').value = R.subtitles.color; $('#rSubHi').value = R.subtitles.hi; $('#rSubBox').checked = R.subtitles.box !== false; $('#rSubSize').value = R.subtitles.size;
+  document.querySelectorAll('#rAspect button').forEach(b => b.classList.toggle('on', b.dataset.a === R.aspect));
+  $('#rExport').checked = !!R.export_avatar;
+}
+async function loadVoices() {
+  LIB.voices = await api('voices').catch(() => []);
+  $('#rVoice').innerHTML = LIB.voices.map(v => `<option value="${esc(v.name)}">🎙 My voice: ${esc(v.name)}</option>`).join('') + '<option value="">🤖 AI reader only (not your voice)</option>';
+  const want = R.voice === null || R.voice === undefined ? (LIB.voices[0] ? LIB.voices[0].name : '') : R.voice;
+  if ([...$('#rVoice').options].some(o => o.value === want)) $('#rVoice').value = want;
+}
+(async () => {
+  await Promise.all([loadFootage(), loadBroll(), loadVoices()]);
+  syncControls(); renderCaps(); renderBroll(); loadModels(); loadEngine(); loadGallery(); preview();
 })();
 </script>
 <?php endif; ?>

@@ -7,10 +7,12 @@
 # It installs the few system tools the app needs (PHP, ffmpeg, Python 3.11, git), gets the app,
 # and runs the engine install (PyTorch, Seed-VC, Demucs, Kokoro and their models: ~3 GB, about 10 minutes).
 # Nothing runs as root on macOS. On Linux, apt-get needs sudo and asks for it.
+# The optional local painter (Z-Image Turbo, ~7 GB) and video (Wan 2.2, 32 GB download) are installed
+# later from inside the app: Showrunner → Engines. This script only tells you about them.
 #
 # Flags:  --yes          answer yes to every question
 #         --no-engine    skip the engine (you can click "Install engine" in the app later)
-#         --ollama       also set up Ollama + a small model for the AI Director and voxel buddies
+#         --ollama       also set up Ollama + a small model for the AI Director, Showrunner and voxel buddies
 #         --dir <path>   where to put the app (default: the current clone, or ~/toon-house)
 #         --no-start     don't start the app at the end
 set -euo pipefail
@@ -24,7 +26,7 @@ while [ $# -gt 0 ]; do
     --ollama) OLLAMA=1 ;;
     --no-start) START=0 ;;
     --dir) DIR="$2"; shift ;;
-    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
     *) echo "Unknown flag: $1 (try --help)"; exit 1 ;;
   esac
   shift
@@ -45,7 +47,7 @@ ask() {   # ask "question" [default y|n] — reads from the terminal even when p
 have() { command -v "$1" >/dev/null 2>&1; }
 
 bold "Toon House installer"
-echo "Put your voice on any song, build talking toons, design games. Everything runs on this machine."
+echo "Put your voice on any song, build talking toons, design games, cut episodes. Everything runs on this machine."
 
 OS="$(uname -s)"
 case "$OS" in
@@ -123,8 +125,12 @@ else
     warn "Skipped. Click 'Install engine' in the app, or run: php index.php setup"
   fi
 fi
+echo "  Optional extras, installed later from the app (Showrunner → ⚙ Engines), Apple Silicon only:"
+echo "    · the local painter: Z-Image Turbo through mflux, ~7 GB. Scene pictures with no account and no network."
+echo "    · local video: Wan 2.2 TI2V-5B through mlx-video, a 32 GB download (or point it at a checkpoint folder you"
+echo "      already have), converted to ~9 GB. Animated backgrounds and B-roll clips; several minutes per clip."
 
-# ── 4. optional: a local model for the AI Director, news scripts, game design and voxel buddies ──
+# ── 4. optional: a local model for the AI Director, news scripts, episodes, game design and voxel buddies ──
 step "Local AI (optional)"
 if have ollama; then
   ok "Ollama is installed"
@@ -132,9 +138,13 @@ if have ollama; then
   if [ -z "$MODELS" ]; then
     if [ "$OLLAMA" = 1 ] || ask "Pull a small model (qwen3.5:2b, ~2 GB) for the AI Director?" n; then ollama pull qwen3.5:2b || warn "Couldn't pull (is the Ollama app running?)"; fi
   else ok "Models: $MODELS"; fi
-elif [ "$OLLAMA" = 1 ] || ask "Install Ollama, so the Director and voxel buddies can use a local model?" n; then
+  echo "  More reader voices: 'ollama pull phonon' adds ~40 named voices (and 'ollama pull phonon:40m-multilingual' Spanish,"
+  echo "  French, Portuguese and German ones). Any speech model in Ollama shows up in the app's Reader lists on its own."
+elif [ "$OLLAMA" = 1 ] || ask "Install Ollama, so the Director, Showrunner and voxel buddies can use a local model?" n; then
   if [ "$PLATFORM" = mac ]; then brew install ollama && brew services start ollama 2>/dev/null || true; else curl -fsSL https://ollama.com/install.sh | sh; fi
   sleep 2; ollama pull qwen3.5:2b || warn "Couldn't pull the model yet. Start Ollama, then: ollama pull qwen3.5:2b"
+  echo "  More reader voices: 'ollama pull phonon' adds ~40 named voices (and 'ollama pull phonon:40m-multilingual' Spanish,"
+  echo "  French, Portuguese and German ones). Any speech model in Ollama shows up in the app's Reader lists on its own."
 else
   echo "  Skipped. The app works without it; install Ollama any time (ollama.com) and the AI features light up."
 fi

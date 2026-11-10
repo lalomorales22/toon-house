@@ -14,3 +14,12 @@ music/
 games/
 buddies/
 nintendo-mold-wizard/
+clips/
+shows/
+recipes/.runs/
+recipes/.baseline/
+server.log
+__pycache__/
+footage/
+broll/
+reals/
