@@ -80,6 +80,22 @@ Every result lands in the **Results** gallery: search by title or voice, filter 
 
 The steps fold up (click a heading) and stay the way you left them. Pick a look in the top right: Classic, Dark, All Gold Everything, Iced Out or **Studio** (graphite and lavender, for long sessions).
 
+## Live Studio — cameras, OBS and your avatar, live
+
+Click **📡 Live Studio** in the header. This room runs [video-stream](https://github.com/lalomorales22/video-stream), the live side of the house: every camera with an OBS-ready link, phones and tablets as cameras, an auto-director that switches OBS scenes for you, a face-tracked avatar, and **Moves** (record a performance once, replay it on any avatar).
+
+- **▶ Start Live Studio** starts it and shows it right here; **■ Stop** shuts it down. It turns your cameras on, so it never starts by itself.
+- **Let devices on my Wi-Fi connect** is off by default, so it only answers this computer. Turn it on before starting if you want phones or tablets to join over Wi-Fi or OBS on another machine to pull the feeds. While it is on, anyone on your Wi-Fi can open the cameras; set an admin password under Setup in Live Studio.
+- **Open in its own tab ↗** gives it a full window (handy on a second monitor).
+
+It is a separate app with its own engine (Python; it holds live video and WebSocket connections open, which this app's PHP server is not built for), so install it once:
+
+```bash
+git clone https://github.com/lalomorales22/video-stream.git && cd video-stream && ./install.sh --all
+```
+
+Toon House finds its `video-stream` launcher by itself, picks a free port (8770 and up), and only ever stops the copy it started. Its log is `live.log` next to `index.php`.
+
 ## Toon Lab — make a cartoon lip-sync to audio
 
 ![Toon Lab — a news anchor toon in the Comic style](docs/toon-lab.jpg)

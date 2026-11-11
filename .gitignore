@@ -23,3 +23,5 @@ __pycache__/
 footage/
 broll/
 reals/
+live.json
+live.log

@@ -25,6 +25,8 @@
  *   php index.php make --prompt "…"    let the local LLM ("Director") write the spec first
  *   php index.php person spec.json     build a new realistic 3D person in Blender (MPFB) for the Realistic 3D style
  *
+ * Live Studio (?p=live): starts/stops the separate video-stream app (cameras, OBS director, avatar + moves) and shows it in a room.
+ *
  * Everything lives next to this file: engine/ (venv, Seed-VC, models), jobs/, voices/, toons/, characters/, renders/, projects/.
  */
 
@@ -56,6 +58,7 @@ define('FOOTAGE', BASE . '/footage');   // Real Avatar: your green-screen clips,
 define('BROLL', BASE . '/broll');       // Real Avatar: screen recordings and other background videos
 define('REALS', BASE . '/reals');       // Real Avatar: one folder per video made (spec, status, the lip-synced avatar, diagnostics)
 define('SETTINGS', BASE . '/settings.json');
+define('LIVE_STATE', BASE . '/live.json');   // Live Studio: the port and pid of the video-stream engine this app started
 define('SYS_PATH', '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin');
 
 // ───────────────────────────── Toon Lab model (shared by the page, the API and agents) ─────────────────────────────
@@ -1334,6 +1337,84 @@ function find_chrome(): ?string {
 }
 
 // ── the Director: a local model (Ollama by default, or any OpenAI-compatible server) turns one sentence into a full spec ──
+// ───────────────────────────── Live Studio ─────────────────────────────
+// The live side of the house — cameras, phones as cameras, the OBS auto-director, the tracked avatar and its recorded
+// moves — is a separate app (video-stream: Python, long-lived WebSockets and video streams, which PHP's built-in server
+// cannot hold open). Toon House starts it, stops it and shows it in a room of its own; it does not contain it.
+function live_bin(): ?string {
+    $home = getenv('HOME') ?: '';
+    if ($home !== '' && is_executable("$home/.local/bin/video-stream")) return "$home/.local/bin/video-stream";   // where its install.sh puts the launcher
+    return find_bin('video-stream');
+}
+function live_probe(int $port): ?array {   // is that port really a video-stream, and not something else that happens to listen there?
+    if ($port < 1024 || $port > 65535) return null;
+    [$code, $j] = http_req("http://127.0.0.1:$port/api/status", null, 2);
+    return ($code === 200 && is_array($j) && isset($j['version'], $j['cameras']) && is_array($j['cameras'])) ? $j : null;
+}
+function live_port_free(int $port): bool {
+    $c = @fsockopen('127.0.0.1', $port, $e, $m, 0.3);
+    if ($c) { fclose($c); return false; }
+    return true;
+}
+function live_status(): array {
+    $st = read_json(LIVE_STATE);
+    $out = ['installed' => live_bin() !== null, 'running' => false, 'ours' => false, 'lan' => !empty($st['lan']), 'port' => null, 'url' => null];
+    foreach (array_unique(array_filter([(int)($st['port'] ?? 0), 8770, 8765])) as $port) {   // ours, the port this app prefers, the engine's own default
+        $j = live_probe($port);
+        if (!$j) continue;
+        $cams = $j['cameras'];
+        $ip = (string)($j['primary_ip'] ?? '');
+        return ['running' => true, 'port' => $port, 'url' => "http://127.0.0.1:$port/",
+            'ours' => (int)($st['port'] ?? 0) === $port && pid_alive((int)($st['pid'] ?? 0)),
+            'network_url' => preg_match('/^[0-9.]+$/', $ip) && $ip !== '127.0.0.1' ? "http://$ip:$port/" : null,
+            'cameras' => count($cams), 'live' => count(array_filter($cams, fn($c) => !empty($c['active']))), 'version' => (string)$j['version']] + $out;
+    }
+    return $out;
+}
+function live_start(bool $lan): array {
+    $now = live_status();
+    if ($now['running']) return $now;
+    $bin = live_bin();
+    if (!$bin) throw new RuntimeException('Live Studio is not installed on this computer yet.');
+    $port = 0;
+    for ($p = 8770; $p < 8790; $p += 2) if (live_port_free($p) && live_port_free($p + 1)) { $port = $p; break; }   // +1 is its HTTPS port for phones on Wi-Fi
+    if (!$port) throw new RuntimeException('No free port between 8770 and 8789 — something else is using them all.');
+    $home = getenv('HOME') ?: '';
+    // Only on this computer unless asked: opened to the Wi-Fi, anyone on it can watch the cameras.
+    $cmd = '(cd ' . escapeshellarg(BASE) . ' && for fd in 3 4 5 6 7 8 9; do eval "exec $fd>&-"; done && exec nohup env HOME=' . escapeshellarg($home)
+        . ' PATH=' . escapeshellarg("$home/.local/bin:" . SYS_PATH) . ' PYTHONUNBUFFERED=1 ' . escapeshellarg($bin)
+        . ' --port ' . $port . ' --phone-https-port ' . ($port + 1) . ' --no-open' . ($lan ? '' : ' --host 127.0.0.1')
+        . ') < /dev/null > ' . escapeshellarg(BASE . '/live.log') . ' 2>&1 & echo $!';
+    $pid = (int)trim((string)shell_exec($cmd));
+    if ($pid <= 0) throw new RuntimeException('Could not start Live Studio.');
+    file_put_contents(LIVE_STATE, json_encode(['pid' => $pid, 'port' => $port, 'lan' => $lan, 'started' => time()], JSON_PRETTY_PRINT));
+    for ($i = 0; $i < 40; $i++) {   // it answers within a second or two; cameras keep warming up after that
+        usleep(250000);
+        if (live_probe($port)) return live_status();
+        if (!pid_alive($pid)) break;
+    }
+    $tail = trim(implode("\n", array_slice(explode("\n", trim((string)@file_get_contents(BASE . '/live.log'))), -4)));
+    throw new RuntimeException('Live Studio did not come up.' . ($tail !== '' ? " Last lines of live.log:\n$tail" : ''));
+}
+function live_stop(): array {
+    $st = read_json(LIVE_STATE);
+    $pid = (int)($st['pid'] ?? 0);
+    // Only ever stop the copy this app started, and only if that pid is still a video-stream (pids get reused).
+    if (pid_alive($pid) && str_contains((string)shell_exec('ps -p ' . $pid . ' -o command= 2>/dev/null'), 'video_stream')) {
+        posix_kill($pid, 15);
+        for ($i = 0; $i < 20 && pid_alive($pid); $i++) usleep(250000);
+    }
+    @unlink(LIVE_STATE);
+    return live_status();
+}
+function live_guard(): void {   // starting a camera server must be a click in this app, never a request another web page made
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') json_out(['error' => 'POST only'], 405);
+    $site = $_SERVER['HTTP_SEC_FETCH_SITE'] ?? '';
+    $origin = $_SERVER['HTTP_ORIGIN'] ?? '';
+    if (($site !== '' && $site !== 'same-origin') || ($origin !== '' && parse_url($origin, PHP_URL_HOST) . ':' . (parse_url($origin, PHP_URL_PORT) ?: 80) !== ($_SERVER['HTTP_HOST'] ?? '')))
+        json_out(['error' => 'That request did not come from Toon House.'], 403);
+}
+
 function settings(): array {
     $s = read_json(SETTINGS);
     if ($s && empty($s['provider'])) $s['provider'] = 'openai';   // saved before Ollama support
@@ -4930,6 +5011,16 @@ if ($a !== '') {
         case 'options':
             json_out(toon_options());
 
+        case 'live_status':
+            json_out(live_status());
+        case 'live_start':
+            live_guard();
+            try { json_out(live_start(!empty($_POST['lan']))); }
+            catch (Throwable $e) { json_out(['error' => $e->getMessage()] + live_status(), 500); }
+        case 'live_stop':
+            live_guard();
+            json_out(live_stop());
+
         case 'settings':
             if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $cur = settings();
@@ -5064,7 +5155,7 @@ if (PHP_SAPI === 'cli-server') {   // the 3D renderer's library and people are p
         readfile(BASE . $path); exit;
     }
 }
-$page = in_array($_GET['p'] ?? '', ['toon', 'game', 'show', 'real'], true) ? $_GET['p'] : 'swap';
+$page = in_array($_GET['p'] ?? '', ['toon', 'game', 'show', 'real', 'live'], true) ? $_GET['p'] : 'swap';
 ?><!doctype html>
 <html lang="en" data-theme="gold">
 <head>
@@ -5450,13 +5541,29 @@ main.real { grid-template-columns:minmax(0,500px) minmax(0,1fr); max-width:1600p
 :root[data-theme="studio"] .swatches button.on { outline:2px solid var(--hi); }
 :root[data-theme="studio"] .story { border-radius:10px; }
 :root[data-theme="studio"] * { scrollbar-width:thin; scrollbar-color:#363d4d transparent; }
+/* Live Studio: one status bar, then the live app fills the rest of the window */
+main.live { display:flex; flex-direction:column; gap:12px; max-width:none; padding:14px 20px 0; height:calc(100vh - 62px); min-height:420px; box-sizing:border-box; }
+.lvhead [hidden] { display:none; }
+main.live .panel { padding:12px 16px; }
+.lvhead { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+.lvhead h2 { margin:0; }
+.lvhead .lvdot { width:10px; height:10px; border-radius:50%; background:var(--muted); flex:none; }
+.lvhead .lvdot.on { background:#2fbf71; box-shadow:0 0 0 3px rgba(47,191,113,.22); }
+.lvhead .lvgrow { flex:1 1 auto; }
+.lvhead label { display:inline-flex; align-items:center; gap:6px; font-size:13px; }
+.lvhead a { color:var(--ink); font-size:13px; font-weight:600; }
+#lvMsg { white-space:pre-wrap; }
+#lvMsg code { user-select:all; }
+#lvFrame { flex:1 1 auto; width:100%; min-height:0; border:2px solid var(--edge); background:#070708; }
+:root[data-theme="studio"] #lvFrame { border:1px solid var(--line); border-radius:12px; }
+#lvFrame[hidden] { display:none; }
 </style>
 </head>
 <body>
 <header>
   <h1>Toon <span>House</span></h1>
-  <nav class="tabs"><a href="./" class="<?= $page === 'swap' ? 'on' : '' ?>">🎤 Voice Swap</a><a href="?p=toon" class="<?= $page === 'toon' ? 'on' : '' ?>">🎬 Toon Lab</a><a href="?p=game" class="<?= $page === 'game' ? 'on' : '' ?>">🕹 Game Creator</a><a href="?p=show" class="<?= $page === 'show' ? 'on' : '' ?>">🎞 Showrunner</a><a href="?p=real" class="<?= $page === 'real' ? 'on' : '' ?>">🧑 Real Avatar</a></nav>
-  <div class="tag"><?= ['swap' => 'put your voice on any song · runs 100% on this Mac', 'toon' => 'build a toon · it lip-syncs & moves to your audio', 'game' => 'your toons star in games you design · no engine, no API', 'show' => 'chain scenes into episodes · every engine and job in one place', 'real' => 'you, on green screen, saying anything in your own voice · over your screen recording'][$page] ?></div>
+  <nav class="tabs"><a href="./" class="<?= $page === 'swap' ? 'on' : '' ?>">🎤 Voice Swap</a><a href="?p=toon" class="<?= $page === 'toon' ? 'on' : '' ?>">🎬 Toon Lab</a><a href="?p=game" class="<?= $page === 'game' ? 'on' : '' ?>">🕹 Game Creator</a><a href="?p=show" class="<?= $page === 'show' ? 'on' : '' ?>">🎞 Showrunner</a><a href="?p=real" class="<?= $page === 'real' ? 'on' : '' ?>">🧑 Real Avatar</a><a href="?p=live" class="<?= $page === 'live' ? 'on' : '' ?>">📡 Live Studio</a></nav>
+  <div class="tag"><?= ['swap' => 'put your voice on any song · runs 100% on this Mac', 'toon' => 'build a toon · it lip-syncs & moves to your audio', 'game' => 'your toons star in games you design · no engine, no API', 'show' => 'chain scenes into episodes · every engine and job in one place', 'real' => 'you, on green screen, saying anything in your own voice · over your screen recording', 'live' => 'cameras, phones as cameras, your avatar and its moves · live into OBS'][$page] ?></div>
   <div class="themes" id="themes">
     <button data-t="classic">Classic</button><button data-t="dark">Dark</button><button data-t="gold">All Gold Everything</button><button data-t="iced">Iced Out</button><button data-t="studio">Studio</button>
   </div>
@@ -10446,6 +10553,81 @@ async function loadVoices() {
 (async () => {
   await Promise.all([loadFootage(), loadBroll(), loadVoices()]);
   syncControls(); renderCaps(); renderBroll(); loadModels(); loadEngine(); loadGallery(); preview();
+})();
+</script>
+<?php endif; ?>
+<?php if ($page === 'live'): ?>
+<main class="live">
+  <section class="panel">
+    <div class="lvhead">
+      <span class="lvdot" id="lvDot"></span>
+      <h2>Live Studio</h2>
+      <span class="meta" id="lvState">checking…</span>
+      <span class="lvgrow"></span>
+      <label id="lvLanWrap" title="Needed for phones and tablets joining over Wi-Fi, and for OBS on another computer. While it is on, anyone on your Wi-Fi can open the cameras."><input type="checkbox" id="lvLan"> Let devices on my Wi-Fi connect</label>
+      <button type="button" id="lvStart" hidden>▶ Start Live Studio</button>
+      <button type="button" id="lvStop" hidden>■ Stop</button>
+      <a id="lvOpen" target="_blank" rel="noopener" hidden>Open in its own tab ↗</a>
+    </div>
+    <div class="hint" id="lvMsg"></div>
+  </section>
+  <iframe id="lvFrame" title="Live Studio" allow="camera; microphone; clipboard-write; fullscreen" hidden></iframe>
+</main>
+<script>
+(() => {
+  const dot = $('#lvDot'), state = $('#lvState'), msg = $('#lvMsg'), frame = $('#lvFrame');
+  const start = $('#lvStart'), stop = $('#lvStop'), open = $('#lvOpen'), lan = $('#lvLan'), lanWrap = $('#lvLanWrap');
+  let shown = null, busy = false;
+  try { lan.checked = localStorage.lvLan === '1'; } catch (e) {}
+  lan.onchange = () => { try { localStorage.lvLan = lan.checked ? '1' : '0'; } catch (e) {} };
+
+  function render(s) {
+    dot.classList.toggle('on', !!s.running);
+    start.hidden = !!s.running || !s.installed;
+    stop.hidden = !(s.running && s.ours);
+    open.hidden = !s.running;
+    lanWrap.hidden = !!s.running || !s.installed;
+    if (s.running) {
+      state.textContent = `running · ${s.live} of ${s.cameras} camera${s.cameras === 1 ? '' : 's'} live`;
+      open.href = s.url;
+      msg.textContent = s.ours ? (s.network_url && s.lan ? `Other devices on your Wi-Fi reach it at ${s.network_url}` : '')
+        : 'It was started outside Toon House, so stop it where you started it.';
+      if (shown !== s.url) { frame.src = s.url; shown = s.url; }   // set once: reloading it would drop the avatar tracker
+      frame.hidden = false;
+    } else {
+      frame.hidden = true;
+      if (shown) { frame.removeAttribute('src'); shown = null; }
+      if (s.installed) {
+        state.textContent = 'not running';
+        msg.textContent = 'Cameras, phones and tablets as cameras, the auto-director for OBS, your tracked avatar and its recorded moves. It turns your cameras on, so it only runs when you start it.';
+      } else {
+        state.textContent = 'not installed';
+        msg.innerHTML = 'Live Studio is a separate free app. Install it once, then come back here:<br><code>git clone https://github.com/lalomorales22/video-stream.git &amp;&amp; cd video-stream &amp;&amp; ./install.sh --all</code>';
+      }
+    }
+  }
+  async function refresh() {
+    if (busy) return;
+    try { render(await api('live_status')); } catch (e) { state.textContent = 'could not check'; msg.textContent = e.message; }
+  }
+  async function act(action, label) {
+    busy = true; start.disabled = stop.disabled = true; state.textContent = label;
+    try {
+      const body = new FormData();
+      body.set('from', 'live');   // never an empty form: the server reads an empty POST as an upload that was too big
+      if (lan.checked) body.set('lan', '1');
+      render(await api(action, body));
+    } catch (e) { msg.textContent = e.message; }
+    busy = false; start.disabled = stop.disabled = false;
+    refresh();
+  }
+  // Fill exactly what is left under the header, however many lines its tabs wrap onto.
+  const fit = () => { const m = document.querySelector('main.live'); m.style.height = Math.max(420, innerHeight - m.getBoundingClientRect().top - scrollY) + 'px'; };
+  addEventListener('resize', fit); fit(); setTimeout(fit, 300);
+  start.onclick = () => act('live_start', 'starting…');
+  stop.onclick = () => act('live_stop', 'stopping…');
+  refresh();
+  setInterval(() => { if (!document.hidden) refresh(); }, 5000);
 })();
 </script>
 <?php endif; ?>
